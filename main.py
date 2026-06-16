@@ -1,14 +1,17 @@
 import os
 import requests
 import time
-import pandas as pd
-from ta.momentum import RSIIndicator
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 
-WATCHLIST = []
+# 🔥 미국 대형 + 인기주 (TOP100 대신 안정 버전)
+SYMBOLS = [
+    "AAPL","TSLA","NVDA","AMD","META","MSFT","AMZN","GOOGL","SPY","QQQ",
+    "PLTR","NFLX","INTC","SOFI","BABA","ORCL","DIS","UBER","LYFT","SNOW",
+    "COIN","MSTR","RIOT","MARA","SHOP","SQ","PYPL","AMD","TSM","BA"
+]
 
 def send(msg):
     try:
@@ -19,64 +22,38 @@ def send(msg):
     except:
         pass
 
-def get_symbols():
-    url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_KEY}"
-    r = requests.get(url).json()
-    if not isinstance(r, list):
-        return []
-    return [x["symbol"] for x in r[:200]]
-
-def get_change(symbol):
-    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
-    q = requests.get(url).json()
-
-    c = q.get("c")
-    pc = q.get("pc")
-
-    if not c or not pc or pc == 0:
-        return None
-
-    return ((c - pc) / pc) * 100, c
-
-def get_rsi(symbol):
-    url = f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}&resolution=15&count=50&token={FINNHUB_KEY}"
-    d = requests.get(url).json()
-
-    if "c" not in d or len(d["c"]) < 10:
-        return None
-
-    close = pd.Series(d["c"])
-    rsi = RSIIndicator(close).rsi()
-
-    if rsi.empty:
-        return None
-
-    return rsi.iloc[-1]
+def get_price(symbol):
+    try:
+        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
+        r = requests.get(url).json()
+        return r
+    except:
+        return {}
 
 print("BOT STARTED")
 
 while True:
     try:
-        symbols = get_symbols()
+        for s in SYMBOLS:
 
-        for s in symbols:
-            res = get_change(s)
-            if not res:
+            data = get_price(s)
+
+            current = data.get("c")
+            prev = data.get("pc")
+
+            if not current or not prev or prev == 0:
                 continue
 
-            change, price = res
+            change = ((current - prev) / prev) * 100
 
-            if change < 20:
-                continue
+            print(s, change)
 
-            rsi = get_rsi(s)
-            if rsi is None:
-                continue
-
-            if change >= 30 and 50 <= rsi <= 70:
-                send(f"🚨 TOP100 급등\n{s}\n+{change:.2f}%\nRSI {rsi:.1f}")
+            # 🚀 실전 기준 (급등 알림)
+            if change >= 5:
+                send(f"🚀 급등 감지\n{s}\n+{change:.2f}%")
 
         time.sleep(60)
 
-    except:
+    except Exception as e:
+        print("error:", e)
         time.sleep(10)
