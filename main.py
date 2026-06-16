@@ -1,21 +1,20 @@
 import os
 import requests
-import time
 
-token = os.getenv("TELEGRAM_TOKEN")
-chat_id = os.getenv("CHAT_ID")
+token = os.environ.get("TELEGRAM_TOKEN")
+chat_id = os.environ.get("CHAT_ID")
 
-while True:
-    try:
-        requests.get(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            params={
-                "chat_id": chat_id,
-                "text": "🚀 Railway 살아있음 테스트"
-            }
-        )
-        print("sent")
-    except Exception as e:
-        print(e)
+if not token or not chat_id:
+    print("환경변수 없음")
+    exit(1)
 
-    time.sleep(60)
+url = f"https://api.telegram.org/bot{token}/sendMessage"
+
+try:
+    requests.get(url, params={
+        "chat_id": chat_id,
+        "text": "🚀 Railway 정상 실행됨"
+    })
+    print("success")
+except Exception as e:
+    print("error:", e)
