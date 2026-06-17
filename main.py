@@ -7,6 +7,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 
+
 # -----------------------------
 # ⛔ 미국장 시간 체크 (UTC)
 # -----------------------------
@@ -15,6 +16,7 @@ def is_market_open():
     hour = now.hour
     minute = now.minute
 
+    # 13:30 ~ 20:00 UTC
     if hour < 13 or hour > 20:
         return False
     if hour == 13 and minute < 30:
@@ -26,7 +28,7 @@ def is_market_open():
 
 
 # -----------------------------
-# 📩 텔레그램 알림
+# 📩 텔레그램
 # -----------------------------
 def send(msg):
     try:
@@ -48,7 +50,7 @@ def get_symbols():
     if not isinstance(r, list):
         return []
 
-    return [x["symbol"] for x in r[:200]]  # 속도 위해 200개 제한
+    return [x["symbol"] for x in r[:200]]
 
 
 # -----------------------------
@@ -74,7 +76,7 @@ def get_price_change(symbol):
 
 
 # -----------------------------
-# 📊 거래량 (5분 캔들 기반)
+# 📊 거래량 비율
 # -----------------------------
 def get_volume_ratio(symbol):
     try:
@@ -98,28 +100,64 @@ def get_volume_ratio(symbol):
 
 
 # -----------------------------
-# 🎯 급등 직전 점수 시스템
+# 🔥 RSI (간단 버전)
 # -----------------------------
-def calc_score(change, volume_ratio):
+def get_rsi(symbol):
+    try:
+        url = f"https://finnhub.io/api/v1/indicator?symbol={symbol}&resolution=5&indicator=rsi&timeperiod=14&token={FINNHUB_KEY}"
+        r = requests.get(url, timeout=5).json()
+
+        values = r.get("rsi", [])
+        if not values:
+            return None
+
+        return values[-1]
+
+    except:
+        return None
+
+
+# -----------------------------
+# 🚀 10분 급등 확률 모델
+# -----------------------------
+def predict_10min_pump(change, volume_ratio, rsi):
     score = 0
 
-    # 📈 초기 상승 구간
-    if 1 <= change <= 6:
-        score += 2
+    # 📈 초기 상승
+    if 1 <= change <= 3:
+        score += 30
+    elif 3 < change <= 6:
+        score += 20
 
-    # 💣 거래량 폭발
-    if volume_ratio >= 3:
-        score += 3
+    # 💣 거래량
+    if volume_ratio >= 4:
+        score += 30
+    elif volume_ratio >= 3:
+        score += 25
     elif volume_ratio >= 2:
-        score += 2
+        score += 15
 
-    return score
+    # 🔥 RSI
+    if 50 <= rsi <= 60:
+        score += 25
+    elif 60 < rsi <= 70:
+        score += 20
+    elif 70 < rsi <= 80:
+        score += 5
+    else:
+        score -= 10
+
+    # ⚠️ 과열 패널티
+    if change > 8:
+        score -= 30
+
+    return max(0, min(score, 100))
 
 
 # -----------------------------
-# 🚀 실행 시작
+# 🚀 실행
 # -----------------------------
-print("🚀 TOP SCANNER STARTED (MOMENTUM MODE)")
+print("🚀 10MIN PUMP MODEL STARTED")
 
 sent = set()
 
@@ -136,35 +174,36 @@ while True:
         for s in symbols:
             price_data = get_price_change(s)
             vol_ratio = get_volume_ratio(s)
+            rsi = get_rsi(s)
 
-            if not price_data or vol_ratio is None:
+            if not price_data or vol_ratio is None or rsi is None:
                 continue
 
             price, change = price_data
 
-            score = calc_score(change, vol_ratio)
+            prob = predict_10min_pump(change, vol_ratio, rsi)
 
-            if score >= 4:
-                results.append((s, price, change, vol_ratio, score))
+            if prob >= 75:
+                results.append((s, price, change, vol_ratio, rsi, prob))
 
-        # 🔥 점수 높은 순 정렬
-        results.sort(key=lambda x: x[4], reverse=True)
+        # 🔥 확률 높은 순 정렬
+        results.sort(key=lambda x: x[5], reverse=True)
 
-        print(f"FOUND: {len(results)} candidates")
+        print(f"FOUND: {len(results)} high-prob candidates")
 
-        # 🚨 상위 알림
-        for s, price, change, vol, score in results[:10]:
+        for s, price, change, vol, rsi, prob in results[:10]:
 
             if s in sent:
                 continue
 
             msg = (
-                f"🚨 급등 직전 포착\n"
+                f"🚨 10분 급등 확률 HIGH\n"
                 f"{s}\n"
                 f"현재가: ${price:.2f}\n"
                 f"등락: +{change:.2f}%\n"
+                f"RSI: {rsi:.1f}\n"
                 f"거래량: {vol:.2f}x\n"
-                f"점수: {score}"
+                f"🔥 확률: {prob}/100"
             )
 
             print(msg)
