@@ -7,9 +7,9 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 FINNHUB_KEY = os.getenv("FINNHUB_KEY")
 
-SCAN_INTERVAL = 120    # 스캔 주기 (초)
-ALERT_COOLDOWN = 600   # 같은 종목 재알림 대기 시간 (초)
-MAX_SYMBOLS = 80       # API 한도 내에서 처리할 최대 종목 수
+SCAN_INTERVAL = 120
+ALERT_COOLDOWN = 600
+TOP_N = 100  # 상승률 상위 N개
 
 
 def is_market_open():
@@ -35,53 +35,62 @@ def send(msg):
         print(f"텔레그램 오류: {e}")
 
 
-def get_symbols():
+# -----------------------------
+# ✅ 핵심 변경: 상승률 상위 100 종목 가져오기
+# Yahoo Finance 스크리너 사용 (무료, 빠름)
+# -----------------------------
+def get_top_gainers(n=TOP_N):
+    """당일 상승률 상위 N개 종목 반환 [(symbol, price, change_pct), ...]"""
     try:
-        r = requests.get(
-            "https://finnhub.io/api/v1/stock/symbol",
-            params={"exchange": "US", "token": FINNHUB_KEY},
-            timeout=10
-        ).json()
-        if not isinstance(r, list):
-            return []
-        # ETF, 워런트, 유닛 제외 — 보통주만
-        return [
-            x["symbol"] for x in r
-            if x.get("type") == "Common Stock" and "." not in x["symbol"]
-        ][:MAX_SYMBOLS]
+        url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+        params = {
+            "scrIds": "day_gainers",
+            "count": n,
+            "lang": "en-US",
+            "region": "US"
+        }
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        r = requests.get(url, params=params, headers=headers, timeout=10).json()
+
+        quotes = (
+            r.get("finance", {})
+             .get("result", [{}])[0]
+             .get("quotes", [])
+        )
+
+        result = []
+        for q in quotes:
+            symbol = q.get("symbol", "")
+            price = q.get("regularMarketPrice")
+            change = q.get("regularMarketChangePercent")
+
+            if not symbol or price is None or change is None:
+                continue
+            if "." in symbol or "-" in symbol:  # ETF/워런트 제외
+                continue
+
+            result.append((symbol, price, change))
+
+        # 상승률 내림차순 정렬
+        result.sort(key=lambda x: x[2], reverse=True)
+        return result[:n]
+
     except Exception as e:
-        print(f"종목 로딩 오류: {e}")
+        print(f"스크리너 오류: {e}")
         return []
 
 
-def get_quote(symbol):
-    """(현재가, 등락률) 반환, 실패 시 None"""
-    try:
-        r = requests.get(
-            "https://finnhub.io/api/v1/quote",
-            params={"symbol": symbol, "token": FINNHUB_KEY},
-            timeout=5
-        ).json()
-        price = r.get("c")
-        prev = r.get("pc")
-        if not price or not prev or prev == 0:
-            return None
-        return price, ((price - prev) / prev) * 100
-    except:
-        return None
-
-
 def get_volume_ratio(symbol):
-    """현재 5분봉 거래량 / 직전 19개 평균 반환"""
     try:
         to_ts = int(time.time())
-        from_ts = to_ts - (20 * 5 * 60)  # 5분봉 20개치 범위
+        from_ts = to_ts - (20 * 5 * 60)
         r = requests.get(
             "https://finnhub.io/api/v1/stock/candle",
             params={
                 "symbol": symbol,
                 "resolution": "5",
-                "from": from_ts,   # ✅ 수정: count → from/to
+                "from": from_ts,
                 "to": to_ts,
                 "token": FINNHUB_KEY
             },
@@ -97,10 +106,9 @@ def get_volume_ratio(symbol):
 
 
 def get_rsi(symbol):
-    """5분봉 RSI(14) 최신값 반환"""
     try:
         to_ts = int(time.time())
-        from_ts = to_ts - (60 * 5 * 60)  # RSI 계산에 충분한 기간
+        from_ts = to_ts - (60 * 5 * 60)
         r = requests.get(
             "https://finnhub.io/api/v1/indicator",
             params={
@@ -128,17 +136,18 @@ def score_pump(change, volume_ratio, rsi):
     elif 3 < change <= 6:
         score += 20
     elif change > 8:
-        score -= 30  # 이미 과열
+        score -= 30
 
-    if volume_ratio >= 4:
-        score += 30
-    elif volume_ratio >= 3:
-        score += 25
-    elif volume_ratio >= 2:
-        score += 15
+    if volume_ratio is not None:
+        if volume_ratio >= 4:
+            score += 30
+        elif volume_ratio >= 3:
+            score += 25
+        elif volume_ratio >= 2:
+            score += 15
 
     if rsi is None:
-        pass  # ✅ 수정: 데이터 없으면 중립 처리 (감점 제거)
+        pass
     elif 50 <= rsi <= 60:
         score += 25
     elif 60 < rsi <= 70:
@@ -151,10 +160,9 @@ def score_pump(change, volume_ratio, rsi):
     return max(0, min(score, 100))
 
 
-# 종목별 마지막 알림 시각 (Unix timestamp)
 alert_times: dict[str, float] = {}
 
-print("🚀 급등 스캐너 시작")
+print("🚀 급등 스캐너 시작 (상승률 상위 100 모드)")
 
 while True:
     try:
@@ -163,44 +171,45 @@ while True:
             time.sleep(300)
             continue
 
-        symbols = get_symbols()
-        print(f"📊 {len(symbols)}개 종목 스캔 중")
+        # ✅ 1단계: 상승률 상위 100 종목 한방에 가져오기
+        gainers = get_top_gainers(TOP_N)
+        print(f"📊 상위 {len(gainers)}개 종목 로드 완료")
+
+        if not gainers:
+            print("⚠️ 종목 로드 실패 — 60초 후 재시도")
+            time.sleep(60)
+            continue
 
         results = []
         now = time.time()
 
-        for s in symbols:
-            time.sleep(0.7)  # ✅ 수정: 분당 ~85호출로 한도 준수
+        # ✅ 2단계: 각 종목에 캔들/RSI만 추가 조회 (quote는 이미 있음)
+        for symbol, price, change in gainers:
+            time.sleep(0.7)  # Finnhub 호출 속도 제한
 
-            quote = get_quote(s)
-            if not quote:
-                continue
-            price, change = quote
+            vol_ratio = get_volume_ratio(symbol)
+            rsi = get_rsi(symbol)
 
-            # 등락률 사전 필터 — 조건 미달 시 캔들/RSI 호출 생략
-            if not (0.5 <= change <= 12):
-                continue
-
-            vol_ratio = get_volume_ratio(s)
-            if vol_ratio is None or vol_ratio < 1.5:
-                continue
-
-            rsi = get_rsi(s)
             prob = score_pump(change, vol_ratio, rsi)
 
+            vol_str = f"{vol_ratio:.2f}x" if vol_ratio else "N/A"
             rsi_str = f"{rsi:.1f}" if rsi else "N/A"
-            print(f"{s:6s} | {change:+.2f}% | 거래량 {vol_ratio:.2f}x | RSI {rsi_str} | 점수 {prob}")
+            print(f"{symbol:6s} | {change:+.2f}% | 거래량 {vol_str} | RSI {rsi_str} | 점수 {prob}")
 
             if prob >= 75:
-                results.append((s, price, change, vol_ratio, rsi, prob))
+                results.append((symbol, price, change, vol_ratio, rsi, prob))
 
         results.sort(key=lambda x: x[5], reverse=True)
+
+        print(f"\n🎯 알림 대상: {len(results)}개")
 
         for s, price, change, vol, rsi, prob in results[:5]:
             last_alert = alert_times.get(s, 0)
             if now - last_alert < ALERT_COOLDOWN:
-                continue  # ✅ 수정: 10분 이내 재알림 방지
+                print(f"  ⏭ {s} 쿨다운 중 ({int((ALERT_COOLDOWN - (now - last_alert)) / 60)}분 남음)")
+                continue
 
+            vol_str = f"{vol:.2f}x" if vol else "N/A"
             rsi_str = f"{rsi:.1f}" if rsi else "N/A"
             msg = (
                 f"🚨 10분 급등 신호\n"
@@ -208,14 +217,15 @@ while True:
                 f"현재가: ${price:.2f}\n"
                 f"등락: +{change:.2f}%\n"
                 f"RSI: {rsi_str}\n"
-                f"거래량: {vol:.2f}x\n"
-                f"🔥 점수: {prob}/100"
+                f"거래량: {vol_str}\n"
+                f"🔥 점수: {prob}/100\n"
+                f"📈 당일 상승률 상위 {gainers.index((s, price, change)) + 1}위"
             )
             print(msg)
             send(msg)
-            alert_times[s] = now  # ✅ 수정: 알림 시각 기록
+            alert_times[s] = now
 
-        print(f"✅ 스캔 완료 — {len(results)}개 감지. {SCAN_INTERVAL}초 후 재스캔\n")
+        print(f"\n✅ 스캔 완료 — {SCAN_INTERVAL}초 후 재스캔\n")
         time.sleep(SCAN_INTERVAL)
 
     except Exception as e:
