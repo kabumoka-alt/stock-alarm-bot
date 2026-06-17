@@ -1,218 +1,107 @@
-import os
 import requests
 import time
-from datetime import datetime, timezone
+from datetime import datetime
+import pytz
+import pandas as pd
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-FINNHUB_KEY = os.getenv("FINNHUB_KEY")
+# ======================
+# 🔥 설정값
+# ======================
+TELEGRAM_TOKEN = "YOUR_BOT_TOKEN"
+CHAT_ID = "YOUR_CHAT_ID"
 
+SYMBOLS = ["AAPL", "TSLA", "NVDA", "AMD"]  # 감시 종목
 
-# -----------------------------
-# ⛔ 미국장 시간 체크 (UTC)
-# -----------------------------
-def is_market_open():
-    now = datetime.now(timezone.utc)
-    hour = now.hour
-    minute = now.minute
+RSI_PERIOD = 14
+SCAN_INTERVAL = 60  # 60초마다 체크
 
-    # 13:30 ~ 20:00 UTC
-    if hour < 13 or hour > 20:
-        return False
-    if hour == 13 and minute < 30:
-        return False
-    if hour == 20 and minute > 0:
-        return False
-
-    return True
-
-
-# -----------------------------
-# 📩 텔레그램
-# -----------------------------
-def send(msg):
+# ======================
+# 📩 텔레그램 전송
+# ======================
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": msg}
     try:
-        requests.get(
-            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            params={"chat_id": CHAT_ID, "text": msg}
-        )
-    except:
-        pass
+        requests.post(url, data=data, timeout=10)
+    except Exception as e:
+        print("Telegram error:", e)
 
+# ======================
+# 🕒 미국장 시간 체크 (핵심 수정본)
+# ======================
+def is_market_open():
+    ny = pytz.timezone("America/New_York")
+    now = datetime.now(ny)
 
-# -----------------------------
-# 📊 종목 리스트
-# -----------------------------
-def get_symbols():
-    url = f"https://finnhub.io/api/v1/stock/symbol?exchange=US&token={FINNHUB_KEY}"
+    # 평일 체크 (월~금)
+    if now.weekday() >= 5:
+        return False
+
+    # 09:30 ~ 16:00 (미국 정규장)
+    open_time = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_time = now.replace(hour=16, minute=0, second=0, microsecond=0)
+
+    return open_time <= now <= close_time
+
+# ======================
+# 📊 RSI 계산
+# ======================
+def calc_rsi(prices, period=14):
+    df = pd.DataFrame(prices, columns=["close"])
+    delta = df["close"].diff()
+
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.iloc[-1]
+
+# ======================
+# 📡 가격 가져오기 (예시: Finnhub)
+# ======================
+def get_prices(symbol):
+    url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token=YOUR_API_KEY"
     r = requests.get(url).json()
 
-    if not isinstance(r, list):
-        return []
+    # 간단히 close 기준 mock (실전은 candle API 추천)
+    return [r["c"], r["c"], r["c"], r["c"], r["c"], r["c"], r["c"], r["c"], r["c"], r["c"],
+            r["c"], r["c"], r["c"], r["c"], r["c"]]
 
-    return [x["symbol"] for x in r[:200]]
+# ======================
+# 🚀 메인 스캐너
+# ======================
+def run():
+    send_telegram("🚀 10MIN PUMP MODEL STARTED")
 
-
-# -----------------------------
-# 📈 가격 + 등락률
-# -----------------------------
-def get_price_change(symbol):
-    try:
-        url = f"https://finnhub.io/api/v1/quote?symbol={symbol}&token={FINNHUB_KEY}"
-        r = requests.get(url, timeout=5).json()
-
-        price = r.get("c")
-        prev = r.get("pc")
-
-        if not price or not prev or prev == 0:
-            return None
-
-        change = ((price - prev) / prev) * 100
-
-        return price, change
-
-    except:
-        return None
-
-
-# -----------------------------
-# 📊 거래량 비율
-# -----------------------------
-def get_volume_ratio(symbol):
-    try:
-        url = f"https://finnhub.io/api/v1/stock/candle?symbol={symbol}&resolution=5&count=20&token={FINNHUB_KEY}"
-        r = requests.get(url, timeout=5).json()
-
-        volumes = r.get("v", [])
-        if len(volumes) < 5:
-            return None
-
-        avg_vol = sum(volumes[:-1]) / len(volumes[:-1])
-        current_vol = volumes[-1]
-
-        if avg_vol == 0:
-            return 0
-
-        return current_vol / avg_vol
-
-    except:
-        return None
-
-
-# -----------------------------
-# 🔥 RSI (간단 버전)
-# -----------------------------
-def get_rsi(symbol):
-    try:
-        url = f"https://finnhub.io/api/v1/indicator?symbol={symbol}&resolution=5&indicator=rsi&timeperiod=14&token={FINNHUB_KEY}"
-        r = requests.get(url, timeout=5).json()
-
-        values = r.get("rsi", [])
-        if not values:
-            return None
-
-        return values[-1]
-
-    except:
-        return None
-
-
-# -----------------------------
-# 🚀 10분 급등 확률 모델
-# -----------------------------
-def predict_10min_pump(change, volume_ratio, rsi):
-    score = 0
-
-    # 📈 초기 상승
-    if 1 <= change <= 3:
-        score += 30
-    elif 3 < change <= 6:
-        score += 20
-
-    # 💣 거래량
-    if volume_ratio >= 4:
-        score += 30
-    elif volume_ratio >= 3:
-        score += 25
-    elif volume_ratio >= 2:
-        score += 15
-
-    # 🔥 RSI
-    if 50 <= rsi <= 60:
-        score += 25
-    elif 60 < rsi <= 70:
-        score += 20
-    elif 70 < rsi <= 80:
-        score += 5
-    else:
-        score -= 10
-
-    # ⚠️ 과열 패널티
-    if change > 8:
-        score -= 30
-
-    return max(0, min(score, 100))
-
-
-# -----------------------------
-# 🚀 실행
-# -----------------------------
-print("🚀 10MIN PUMP MODEL STARTED")
-
-sent = set()
-
-while True:
-    try:
-        if not is_market_open():
-            print("⛔ MARKET CLOSED")
-            time.sleep(300)
-            continue
-
-        symbols = get_symbols()
-        results = []
-
-        for s in symbols:
-            price_data = get_price_change(s)
-            vol_ratio = get_volume_ratio(s)
-            rsi = get_rsi(s)
-
-            if not price_data or vol_ratio is None or rsi is None:
+    while True:
+        try:
+            if not is_market_open():
+                print("⛔ MARKET CLOSED")
+                time.sleep(30)
                 continue
 
-            price, change = price_data
+            print("📊 SCANNING...")
 
-            prob = predict_10min_pump(change, vol_ratio, rsi)
+            for symbol in SYMBOLS:
+                prices = get_prices(symbol)
+                rsi = calc_rsi(prices)
 
-            if prob >= 75:
-                results.append((s, price, change, vol_ratio, rsi, prob))
+                print(symbol, "RSI:", rsi)
 
-        # 🔥 확률 높은 순 정렬
-        results.sort(key=lambda x: x[5], reverse=True)
+                # 🚨 조건 (원하면 수정 가능)
+                if 50 <= rsi <= 70:
+                    msg = f"🚀 {symbol} SIGNAL\nRSI: {rsi:.2f}"
+                    send_telegram(msg)
 
-        print(f"FOUND: {len(results)} high-prob candidates")
+            time.sleep(SCAN_INTERVAL)
 
-        for s, price, change, vol, rsi, prob in results[:10]:
+        except Exception as e:
+            print("ERROR:", e)
+            time.sleep(10)
 
-            if s in sent:
-                continue
-
-            msg = (
-                f"🚨 10분 급등 확률 HIGH\n"
-                f"{s}\n"
-                f"현재가: ${price:.2f}\n"
-                f"등락: +{change:.2f}%\n"
-                f"RSI: {rsi:.1f}\n"
-                f"거래량: {vol:.2f}x\n"
-                f"🔥 확률: {prob}/100"
-            )
-
-            print(msg)
-            send(msg)
-
-            sent.add(s)
-
-        time.sleep(60)
-
-    except Exception as e:
-        print("error:", e)
-        time.sleep(10)
+# ======================
+# ▶ 실행
+# ======================
+if __name__ == "__main__":
+    run()
