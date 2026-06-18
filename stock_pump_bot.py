@@ -87,7 +87,7 @@ def get_active_symbols():
 
 def get_snapshots(symbols: list):
     url = "https://data.alpaca.markets/v2/stocks/snapshots"
-    params = {"symbols": ",".join(symbols), "feed": "iex", "currency": "USD"}
+    params = {"symbols": ",".join(symbols)}
     try:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
         if resp.status_code == 200:
