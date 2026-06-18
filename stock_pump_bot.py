@@ -283,7 +283,8 @@ def run_scan(session: str):
             )
 
         send_telegram(message)
-        print(f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}% | RSI {result['rsi']:.1f}")
+        rsi_str = f"{result['rsi']:.1f}" if result['rsi'] is not None else "N/A"
+        print(f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}% | RSI {rsi_str}")
         time.sleep(0.5)
 
 
