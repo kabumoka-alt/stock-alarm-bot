@@ -190,8 +190,17 @@ def run_scan(session: str):
         if not current_price:
             continue
 
-        change_pct = ((current_price - prev["c"]) / prev["c"]) * 100
-        ranked.append({"symbol": sym, "price": current_price, "change_pct": change_pct})
+        prev_close = prev["c"]
+        change_pct = ((current_price - prev_close) / prev_close) * 100
+        # 가격 출처 표시
+        price_source = "호가" if latest_trade.get("p") else ("1분봉" if minute_bar.get("c") else "종가")
+        ranked.append({
+            "symbol": sym,
+            "price": current_price,
+            "price_source": price_source,
+            "prev_close": prev_close,
+            "change_pct": change_pct
+        })
 
     ranked = sorted(ranked, key=lambda x: x["change_pct"], reverse=True)
     is_extended = session in ("pre", "after", "overnight")
@@ -223,7 +232,8 @@ def run_scan(session: str):
                 f"{session_label} <b>급등 신호!</b>\n"
                 f"━━━━━━━━━━━━━━\n"
                 f"📌 종목: <b>{sym}</b>\n"
-                f"💰 현재가: ${stock['price']:.2f}\n"
+                f"💰 현재가({stock.get('price_source','?')}): <b>${stock['price']:.2f}</b>\n"
+                f"📉 전일종가: ${stock.get('prev_close', 0):.2f}\n"
                 f"📈 일중 상승률: <b>{stock['change_pct']:+.2f}%</b>\n"
                 f"⚡ 5분 상승: <b>{result['price_change_5m']:+.2f}%</b>\n"
                 f"📊 RSI: <b>{result['rsi']:.1f}</b>\n"
@@ -235,7 +245,8 @@ def run_scan(session: str):
                 f"{session_label} <b>급등 + RSI 신호!</b>\n"
                 f"━━━━━━━━━━━━━━\n"
                 f"📌 종목: <b>{sym}</b>\n"
-                f"💰 현재가: ${stock['price']:.2f}\n"
+                f"💰 현재가({stock.get('price_source','?')}): <b>${stock['price']:.2f}</b>\n"
+                f"📉 전일종가: ${stock.get('prev_close', 0):.2f}\n"
                 f"📈 일중 상승률: <b>{stock['change_pct']:+.2f}%</b>\n"
                 f"📊 RSI: <b>{result['rsi']:.1f}</b>\n"
                 f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
