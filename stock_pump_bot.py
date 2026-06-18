@@ -87,7 +87,7 @@ def get_active_symbols():
 
 def get_snapshots(symbols: list):
     url = "https://data.alpaca.markets/v2/stocks/snapshots"
-    params = {"symbols": ",".join(symbols), "feed": "sip"}
+    params = {"symbols": ",".join(symbols), "feed": "iex", "currency": "USD"}
     try:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
         if resp.status_code == 200:
@@ -101,7 +101,7 @@ def get_snapshots(symbols: list):
 
 def get_bars(symbol: str, limit: int = 30):
     url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
-    params = {"timeframe": "1Min", "limit": limit, "feed": "sip", "sort": "asc"}
+    params = {"timeframe": "1Min", "limit": limit, "feed": "iex", "sort": "asc"}
     try:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
         if resp.status_code == 200:
