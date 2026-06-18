@@ -131,6 +131,7 @@ def analyze_symbol(symbol: str, extended: bool = False, is_overnight: bool = Fal
     """종목 분석. extended=True면 프리/애프터 조건 추가"""
     bars = get_bars(symbol, limit=30)
     if not bars or len(bars) < 6:
+        print(f"    └ 데이터 부족: {len(bars) if bars else 0}개")
         return None
 
     rsi = calc_rsi(bars)
@@ -221,6 +222,7 @@ def run_scan(session: str):
             if elapsed < COOLDOWN_MINUTES:
                 continue
 
+        print(f"  [{sym}] 분석 중...")
         result = analyze_symbol(sym, extended=is_extended, is_overnight=(session == "overnight"))
         if result is None:
             continue
