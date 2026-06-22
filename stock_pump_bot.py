@@ -1,13 +1,13 @@
 """
-미국 주식 급등 감지 봇 v12 (정규장 전용 + 시뮬레이션)
+미국 주식 급등 감지 봇 v13 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 5분봉 5%+ & RSI 50+ 조건
 - OBV 방향 참고 표시 (필터 아님)
-- 매도 타이밍: +7% 1차, +15% 전량, -4% 손절
-- 매도 후에도 모니터링 유지 (재진입 대응)
-- [v12 신규] 시뮬레이션: 매수 신호 시 2주 자동 매수 기록,
-  +7% 1주 절반매도 / +15%·손절 나머지 전량 청산,
-  텔레그램에 건별 손익 + 누적 손익 전송
+- 매도 타이밍: +7% 1차(절반), +15% 전량, -4% 손절
+- [v12] 시뮬레이션: 2주 매수 / 예수금 관리 / 누적 손익
+- [v13] 보유 종목 현황 메시지 표시
+- [v13] 매시 정각 중간 매매일지 전송
+- [v13] 장 종료(16:00 ET) 최종 매매일지 전송
 """
 
 import os
@@ -15,52 +15,57 @@ import time
 import requests
 from datetime import datetime, timezone, timedelta
 
-ALPACA_API_KEY = os.environ["ALPACA_API_KEY"]
+ALPACA_API_KEY    = os.environ["ALPACA_API_KEY"]
 ALPACA_SECRET_KEY = os.environ["ALPACA_SECRET_KEY"]
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 
 # 정규장 조건
-REGULAR_TOP_N = 50
-REGULAR_RSI = 50
+REGULAR_TOP_N   = 50
+REGULAR_RSI     = 50
 PRICE_CHANGE_5M = 5.0
 
-CHECK_INTERVAL = 60
-COOLDOWN_MINUTES = 30
-
-# 매도 알림 쿨다운
+CHECK_INTERVAL       = 60
+COOLDOWN_MINUTES     = 30
 SELL_COOLDOWN_MINUTES = 60
 
 # 매도 타이밍 임계값
-SELL_PARTIAL_PCT = 7.0    # +7% 1차 매도
-SELL_FULL_PCT = 15.0      # +15% 전량 매도
-STOP_LOSS_PCT = -4.0      # -4% 손절
+SELL_PARTIAL_PCT = 7.0
+SELL_FULL_PCT    = 15.0
+STOP_LOSS_PCT    = -4.0
 
 HEADERS = {
-    "APCA-API-KEY-ID": ALPACA_API_KEY,
-    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY
+    "APCA-API-KEY-ID":    ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
 }
 
 entry_prices = {}
-last_alert = {}
+last_alert   = {}
 
 # ──────────────────────────────────────────
 # 시뮬레이션 상태
 # ──────────────────────────────────────────
-# sim_positions: { sym: {"entry": float, "qty": int, "partial_done": bool} }
-# - partial_done: +7% 1차 매도(절반) 이미 처리했는지 여부
-sim_positions: dict = {}
+SIM_INITIAL_CASH = 100.0
 
-# sim_stats: 누적 통계
-SIM_INITIAL_CASH = 100.0   # 초기 예수금 ($)
+sim_positions: dict = {}
+# { sym: {"entry": float, "qty": int, "partial_done": bool} }
+
+SIM_INITIAL_CASH = 100.0
 sim_stats = {
     "initial_cash": SIM_INITIAL_CASH,
-    "cash": SIM_INITIAL_CASH,  # 현재 예수금 (매수 시 차감, 매도 시 반환)
-    "total_pnl": 0.0,          # 누적 실현 손익 (달러)
-    "trades": 0,               # 완전 청산된 거래 수
-    "wins": 0,
-    "losses": 0,
+    "cash":         SIM_INITIAL_CASH,
+    "total_pnl":    0.0,
+    "trades":       0,
+    "wins":         0,
+    "losses":       0,
 }
+
+# 오늘 거래 일지: [{"sym", "action", "qty", "price", "pnl", "pnl_pct", "time_kst"}]
+trade_log: list = []
+
+# 매시 정각 / 장마감 전송 추적
+last_hourly_report_et: int = -1   # 마지막으로 보낸 정각 시각(시 단위)
+market_close_sent: bool    = False
 
 
 # ──────────────────────────────────────────
@@ -75,9 +80,9 @@ def send_telegram(message: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       message,
+            "parse_mode": "HTML",
         }, timeout=5)
         if resp.status_code != 200:
             print(f"[텔레그램 오류] {resp.text}")
@@ -85,15 +90,87 @@ def send_telegram(message: str):
         print(f"[텔레그램 예외] {e}")
 
 
-def is_regular_session() -> bool:
-    now_utc = datetime.now(timezone.utc)
-    now_et = now_utc + timedelta(hours=-4)
-    weekday = now_et.weekday()
-    et_min = now_et.hour * 60 + now_et.minute
+def get_et_now():
+    return datetime.now(timezone.utc) + timedelta(hours=-4)
 
-    if weekday >= 5:
+
+def is_regular_session() -> bool:
+    now_et  = get_et_now()
+    et_min  = now_et.hour * 60 + now_et.minute
+    if now_et.weekday() >= 5:
         return False
     return (9 * 60 + 30) <= et_min <= (16 * 60)
+
+
+# ──────────────────────────────────────────
+# 보유 종목 현황 블록
+# ──────────────────────────────────────────
+
+def holdings_block() -> str:
+    """현재 보유 종목 상세 블록 (텔레그램용)"""
+    if not sim_positions:
+        return "📭 <b>보유 종목:</b> 없음"
+    lines = ["📦 <b>보유 종목:</b>"]
+    for sym, pos in sim_positions.items():
+        status = "1차완료" if pos["partial_done"] else "전량보유"
+        lines.append(
+            f"  • {naver_link(sym)} {pos['qty']}주 @ ${pos['entry']:.2f} [{status}]"
+        )
+    return "\n".join(lines)
+
+
+# ──────────────────────────────────────────
+# 매매일지 빌더
+# ──────────────────────────────────────────
+
+def build_trade_report(title: str) -> str:
+    """매매일지 텔레그램 메시지 생성"""
+    now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
+    total_return_pct = (sim_stats["total_pnl"] / sim_stats["initial_cash"]) * 100
+    win_rate = (
+        sim_stats["wins"] / sim_stats["trades"] * 100
+        if sim_stats["trades"] > 0 else 0.0
+    )
+
+    lines = [
+        f"📋 <b>{title}</b>",
+        f"🇰🇷 {now_kst.strftime('%m/%d %H:%M')} KST",
+        f"━━━━━━━━━━━━━━",
+    ]
+
+    # 거래 내역
+    if trade_log:
+        lines.append("📝 <b>거래 내역:</b>")
+        for t in trade_log:
+            icon = "📥" if t["action"] == "BUY" else ("📈" if t["pnl"] >= 0 else "📉")
+            if t["action"] == "BUY":
+                lines.append(
+                    f"  {icon} {t['time_kst']} {t['sym']} {t['qty']}주 매수 @ ${t['price']:.2f}"
+                )
+            else:
+                lines.append(
+                    f"  {icon} {t['time_kst']} {t['sym']} {t['qty']}주 {t['reason']} "
+                    f"@ ${t['price']:.2f} ({t['pnl']:+.2f}$, {t['pnl_pct']:+.2f}%)"
+                )
+    else:
+        lines.append("📝 거래 내역: 없음")
+
+    lines.append("━━━━━━━━━━━━━━")
+
+    # 현재 보유
+    lines.append(holdings_block())
+    lines.append("━━━━━━━━━━━━━━")
+
+    # 종합 통계
+    pnl_sign = "+" if sim_stats["total_pnl"] >= 0 else ""
+    lines += [
+        f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>",
+        f"💰 누적 손익: <b>{pnl_sign}{sim_stats['total_pnl']:.2f}$</b> "
+        f"(<b>{total_return_pct:+.2f}%</b>)",
+        f"🏆 {sim_stats['wins']}승 {sim_stats['losses']}패 "
+        f"(승률 {win_rate:.0f}%) | 총 {sim_stats['trades']}거래",
+    ]
+    return "\n".join(lines)
 
 
 # ──────────────────────────────────────────
@@ -103,50 +180,58 @@ def is_regular_session() -> bool:
 def sim_open(sym: str, price: float) -> bool:
     """매수 신호 → 2주 매수 기록 + 예수금 차감. 예수금 부족 시 False 반환."""
     if sym in sim_positions:
-        return False  # 이미 보유 중
+        return False
     cost = price * 2
     if sim_stats["cash"] < cost:
         print(f"  [시뮬 매수 불가] {sym} | 필요: ${cost:.2f} | 예수금: ${sim_stats['cash']:.2f}")
         return False
     sim_stats["cash"] -= cost
-    sim_positions[sym] = {
-        "entry": price,
-        "qty": 2,
-        "partial_done": False,
-    }
+    sim_positions[sym] = {"entry": price, "qty": 2, "partial_done": False}
+    now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
+    trade_log.append({
+        "action": "BUY", "sym": sym, "qty": 2, "price": price,
+        "pnl": 0.0, "pnl_pct": 0.0, "reason": "매수",
+        "time_kst": now_kst.strftime("%H:%M"),
+    })
     print(f"  [시뮬 매수] {sym} 2주 @ ${price:.2f} | 잔여 예수금: ${sim_stats['cash']:.2f}")
     return True
 
 
 def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
     """
-    포지션 청산 처리.
+    포지션 청산.
     qty=None 이면 전량 청산.
-    반환값: 텔레그램에 붙일 시뮬 요약 문자열. 포지션 없으면 빈 문자열.
+    반환값: 텔레그램 시뮬 요약 문자열.
     """
     pos = sim_positions.get(sym)
     if not pos:
         return ""
 
     close_qty = qty if qty is not None else pos["qty"]
-    pnl = (exit_price - pos["entry"]) * close_qty
-    pnl_pct = ((exit_price - pos["entry"]) / pos["entry"]) * 100
+    pnl       = (exit_price - pos["entry"]) * close_qty
+    pnl_pct   = ((exit_price - pos["entry"]) / pos["entry"]) * 100
 
-    # 예수금 반환 (매도 대금)
     sim_stats["cash"] += exit_price * close_qty
-
     pos["qty"] -= close_qty
+
     if pos["qty"] <= 0:
         del sim_positions[sym]
         sim_stats["total_pnl"] += pnl
-        sim_stats["trades"] += 1
+        sim_stats["trades"]    += 1
         if pnl >= 0:
-            sim_stats["wins"] += 1
+            sim_stats["wins"]   += 1
         else:
             sim_stats["losses"] += 1
     else:
-        pos["partial_done"] = True
+        pos["partial_done"]     = True
         sim_stats["total_pnl"] += pnl
+
+    now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
+    trade_log.append({
+        "action": "SELL", "sym": sym, "qty": close_qty, "price": exit_price,
+        "pnl": pnl, "pnl_pct": pnl_pct, "reason": reason,
+        "time_kst": now_kst.strftime("%H:%M"),
+    })
 
     win_rate = (
         sim_stats["wins"] / sim_stats["trades"] * 100
@@ -154,27 +239,22 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
     )
     total_return_pct = (sim_stats["total_pnl"] / sim_stats["initial_cash"]) * 100
 
+    # 보유 현황 포함
     summary = (
         f"\n\n💹 <b>[시뮬레이션]</b>\n"
         f"━━━━━━━━━━━━━━\n"
         f"📤 청산: {reason} | {close_qty}주 @ ${exit_price:.2f}\n"
         f"📥 진입가: ${pos['entry']:.2f}\n"
-        f"{'📈' if pnl >= 0 else '📉'} 건별 손익: <b>{'+'if pnl>=0 else ''}{pnl:.2f}$ ({pnl_pct:+.2f}%)</b>\n"
+        f"{'📈' if pnl >= 0 else '📉'} 건별 손익: "
+        f"<b>{'+' if pnl >= 0 else ''}{pnl:.2f}$ ({pnl_pct:+.2f}%)</b>\n"
         f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>\n"
-        f"💰 누적 손익: <b>{'+'if sim_stats['total_pnl']>=0 else ''}{sim_stats['total_pnl']:.2f}$</b> "
-        f"(<b>{total_return_pct:+.2f}%</b>)\n"
-        f"🏆 승/패: {sim_stats['wins']}승 {sim_stats['losses']}패 "
-        f"(승률 {win_rate:.0f}%) | 총 {sim_stats['trades']}거래"
+        f"💰 누적 손익: <b>{'+' if sim_stats['total_pnl'] >= 0 else ''}"
+        f"{sim_stats['total_pnl']:.2f}$</b> (<b>{total_return_pct:+.2f}%</b>)\n"
+        f"🏆 {sim_stats['wins']}승 {sim_stats['losses']}패 "
+        f"(승률 {win_rate:.0f}%) | 총 {sim_stats['trades']}거래\n"
+        f"{holdings_block()}"
     )
     return summary
-
-
-def sim_status_line() -> str:
-    """현재 시뮬 보유 현황 한 줄 요약"""
-    if not sim_positions:
-        return "📭 시뮬 보유 없음"
-    items = [f"{s}({p['qty']}주@${p['entry']:.2f})" for s, p in sim_positions.items()]
-    return "📦 보유: " + " / ".join(items[:5])  # 최대 5개만 표시
 
 
 # ──────────────────────────────────────────
@@ -182,7 +262,7 @@ def sim_status_line() -> str:
 # ──────────────────────────────────────────
 
 def get_active_symbols():
-    url = "https://data.alpaca.markets/v1beta1/screener/stocks/most-actives"
+    url    = "https://data.alpaca.markets/v1beta1/screener/stocks/most-actives"
     params = {"by": "trades", "top": 100}
     try:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
@@ -196,7 +276,7 @@ def get_active_symbols():
 
 
 def get_snapshots(symbols: list):
-    url = "https://data.alpaca.markets/v2/stocks/snapshots"
+    url    = "https://data.alpaca.markets/v2/stocks/snapshots"
     params = {"symbols": ",".join(symbols)}
     try:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
@@ -210,7 +290,7 @@ def get_snapshots(symbols: list):
 
 
 def get_bars(symbol: str, limit: int = 30):
-    url = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+    url    = f"https://data.alpaca.markets/v2/stocks/{symbol}/bars"
     params = {"timeframe": "1Min", "limit": limit, "sort": "asc"}
     try:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
@@ -248,30 +328,25 @@ def calc_rsi(bars: list, period: int = 14):
 
 
 def calc_obv(bars: list) -> str:
-    """OBV 방향 판단 (참고용, 필터 아님) — 최근 5봉 기준"""
     if len(bars) < 3:
         return "-"
-
-    obv = 0
-    obv_list = []
+    obv, obv_list = 0, []
     for i, bar in enumerate(bars):
         if i == 0:
             obv_list.append(obv)
             continue
-        close = float(bar["c"])
+        close      = float(bar["c"])
         prev_close = float(bars[i - 1]["c"])
-        vol = float(bar["v"])
+        vol        = float(bar["v"])
         if close > prev_close:
             obv += vol
         elif close < prev_close:
             obv -= vol
         obv_list.append(obv)
-
-    recent = obv_list[-5:]
-    rising = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i - 1])
+    recent  = obv_list[-5:]
+    rising  = sum(1 for i in range(1, len(recent)) if recent[i] > recent[i - 1])
     falling = len(recent) - 1 - rising
-
-    if rising >= 3:
+    if rising  >= 3:
         return "📈상승"
     elif falling >= 3:
         return "📉하락"
@@ -280,11 +355,11 @@ def calc_obv(bars: list) -> str:
 
 
 def get_live_price(snap: dict):
-    latest_trade = snap.get("latestTrade", {})
-    minute_bar = snap.get("minuteBar", {})
-    daily_bar = snap.get("dailyBar", {})
-    price = latest_trade.get("p") or minute_bar.get("c") or daily_bar.get("c")
-    source = "호가" if latest_trade.get("p") else ("1분봉" if minute_bar.get("c") else "종가")
+    lt    = snap.get("latestTrade", {})
+    mb    = snap.get("minuteBar",   {})
+    db    = snap.get("dailyBar",    {})
+    price  = lt.get("p") or mb.get("c") or db.get("c")
+    source = "호가" if lt.get("p") else ("1분봉" if mb.get("c") else "종가")
     return price, source
 
 
@@ -300,29 +375,26 @@ def build_ranked(snapshots: dict):
         prev_close = prev["c"]
         change_pct = ((current_price - prev_close) / prev_close) * 100
         ranked.append({
-            "symbol": sym,
-            "price": current_price,
+            "symbol": sym, "price": current_price,
             "price_source": price_source,
-            "prev_close": prev_close,
-            "change_pct": change_pct,
-            "snap": snap
+            "prev_close": prev_close, "change_pct": change_pct,
+            "snap": snap,
         })
     return sorted(ranked, key=lambda x: x["change_pct"], reverse=True)
 
 
 # ──────────────────────────────────────────
-# 매도 타이밍 체크 (알림 + 시뮬 청산)
+# 매도 타이밍 체크
 # ──────────────────────────────────────────
 
 def check_sell_timing(sym: str, current_price: float, price_source: str):
     if sym not in entry_prices:
         return
-
-    entry = entry_prices[sym]
+    entry       = entry_prices[sym]
     entry_price = entry["entry"]
-    now_utc = datetime.now(timezone.utc)
-    now_kst = now_utc + timedelta(hours=9)
-    gain_pct = ((current_price - entry_price) / entry_price) * 100
+    now_utc     = datetime.now(timezone.utc)
+    now_kst     = now_utc + timedelta(hours=9)
+    gain_pct    = ((current_price - entry_price) / entry_price) * 100
     ticker_link = naver_link(sym)
 
     def cooldown_ok(key):
@@ -335,12 +407,7 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
     if gain_pct <= STOP_LOSS_PCT:
         if cooldown_ok("stop"):
             entry["stop"] = now_utc
-
-            # 시뮬 청산
-            sim_note = ""
-            if sym in sim_positions:
-                sim_note = sim_close(sym, current_price, "손절(-4%)", qty=None)
-
+            sim_note = sim_close(sym, current_price, "손절(-4%)", qty=None) if sym in sim_positions else ""
             send_telegram(
                 f"🔴 <b>손절 타이밍!</b>\n"
                 f"━━━━━━━━━━━━━━\n"
@@ -350,7 +417,7 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
                 f"📉 수익률: <b>{gain_pct:+.2f}%</b>\n"
                 f"⚠️ -4% 손절 구간 진입\n"
                 f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
-                + (sim_note if sim_note else "")
+                + sim_note
             )
             print(f"[🔴 손절] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
         return
@@ -359,11 +426,7 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
     if gain_pct >= SELL_FULL_PCT:
         if cooldown_ok("alert2"):
             entry["alert2"] = now_utc
-
-            sim_note = ""
-            if sym in sim_positions:
-                sim_note = sim_close(sym, current_price, "+15% 전량", qty=None)
-
+            sim_note = sim_close(sym, current_price, "+15% 전량", qty=None) if sym in sim_positions else ""
             send_telegram(
                 f"🟢 <b>전량 매도 타이밍!</b>\n"
                 f"━━━━━━━━━━━━━━\n"
@@ -373,7 +436,7 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
                 f"📈 수익률: <b>{gain_pct:+.2f}%</b>\n"
                 f"✅ +15% 전량 매도 구간\n"
                 f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
-                + (sim_note if sim_note else "")
+                + sim_note
             )
             print(f"[🟢 전량매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
         return
@@ -382,13 +445,9 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
     if gain_pct >= SELL_PARTIAL_PCT:
         if cooldown_ok("alert1"):
             entry["alert1"] = now_utc
-
-            sim_note = ""
-            pos = sim_positions.get(sym)
-            if pos and not pos.get("partial_done"):
-                # 2주 중 1주만 절반 매도
-                sim_note = sim_close(sym, current_price, "+7% 1차(절반)", qty=1)
-
+            pos      = sim_positions.get(sym)
+            sim_note = sim_close(sym, current_price, "+7% 1차(절반)", qty=1) \
+                       if pos and not pos.get("partial_done") else ""
             send_telegram(
                 f"🟡 <b>1차 매도 타이밍!</b>\n"
                 f"━━━━━━━━━━━━━━\n"
@@ -398,7 +457,7 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
                 f"📈 수익률: <b>{gain_pct:+.2f}%</b>\n"
                 f"💡 +7% → 절반 매도 후 나머지 홀드\n"
                 f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
-                + (sim_note if sim_note else "")
+                + sim_note
             )
             print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
 
@@ -412,27 +471,57 @@ def analyze_regular(sym: str, snap: dict):
     if not bars or len(bars) < 6:
         print(f"  └ 데이터 부족: {len(bars) if bars else 0}개")
         return None
-
     latest_price, _ = get_live_price(snap)
-    current_price = latest_price or float(bars[-1]["c"])
-    price_5m_ago = float(bars[-6]["c"])
-
+    current_price   = latest_price or float(bars[-1]["c"])
+    price_5m_ago    = float(bars[-6]["c"])
     if price_5m_ago <= 0:
         return None
-
     price_change_5m = ((current_price - price_5m_ago) / price_5m_ago) * 100
-    rsi = calc_rsi(bars)
+    rsi             = calc_rsi(bars)
     if rsi is None:
         return None
-
     obv_label = calc_obv(bars)
-    price_ok = "✅" if price_change_5m >= PRICE_CHANGE_5M else "❌"
+    price_ok  = "✅" if price_change_5m >= PRICE_CHANGE_5M else "❌"
     print(f"  └ RSI:{rsi:.1f} | 5분:{price_change_5m:+.2f}%{price_ok} | OBV:{obv_label}")
-
     if price_change_5m < PRICE_CHANGE_5M or rsi < REGULAR_RSI:
         return None
-
     return {"rsi": rsi, "price_change_5m": price_change_5m, "obv_label": obv_label}
+
+
+# ──────────────────────────────────────────
+# 정기 리포트 (매시 정각 / 장마감)
+# ──────────────────────────────────────────
+
+def check_scheduled_reports():
+    """매 루프마다 호출 — 정각 중간 일지 및 장마감 최종 일지 전송"""
+    global last_hourly_report_et, market_close_sent
+
+    now_et  = get_et_now()
+    et_hour = now_et.hour
+    et_min  = now_et.minute
+    weekday = now_et.weekday()
+
+    if weekday >= 5:
+        return
+
+    # ── 장 종료 최종 일지 (16:00~16:02 ET, 1회) ──
+    if et_hour == 16 and et_min <= 2 and not market_close_sent:
+        market_close_sent = True
+        print("[📊 장마감 최종 매매일지 전송]")
+        send_telegram(build_trade_report("🔔 장 종료 최종 매매일지"))
+        return
+
+    # 장중(09:30~16:00)에만 정각 리포트
+    if not ((9 * 60 + 30) <= (et_hour * 60 + et_min) <= 16 * 60):
+        return
+
+    # ── 매시 정각 중간 일지 (XX:00~XX:02, 1회/시) ──
+    if et_min <= 2 and et_hour != last_hourly_report_et and et_hour >= 10:
+        last_hourly_report_et = et_hour
+        now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
+        title   = f"🕐 {et_hour}:00 ET ({now_kst.strftime('%H:%M')} KST) 중간 매매일지"
+        print(f"[📊 정각 매매일지 전송] {et_hour}:00 ET")
+        send_telegram(build_trade_report(title))
 
 
 # ──────────────────────────────────────────
@@ -443,11 +532,9 @@ def run_scan():
     symbols = get_active_symbols()
     if not symbols:
         return
-
     snapshots = get_snapshots(symbols)
     if not snapshots:
         return
-
     ranked = build_ranked(snapshots)
     if not ranked:
         return
@@ -455,7 +542,6 @@ def run_scan():
     now_utc = datetime.now(timezone.utc)
     now_kst = now_utc + timedelta(hours=9)
 
-    # 매도 타이밍 체크 (시뮬 청산 포함)
     snap_map = {s["symbol"]: s for s in ranked}
     for sym in list(entry_prices.keys()):
         if sym in snap_map:
@@ -464,11 +550,10 @@ def run_scan():
 
     top = ranked[:REGULAR_TOP_N]
     print(f"[정규장] 상위 {REGULAR_TOP_N}종목 | 1위: {top[0]['symbol']} {top[0]['change_pct']:+.2f}%")
-    print(f"  {sim_status_line()}")
+    print(f"  {holdings_block().replace(chr(10), ' | ')}")
 
     for stock in top:
         sym = stock["symbol"]
-
         if sym in last_alert:
             elapsed = (now_utc - last_alert[sym]).total_seconds() / 60
             if elapsed < COOLDOWN_MINUTES:
@@ -481,23 +566,18 @@ def run_scan():
 
         last_alert[sym] = now_utc
         entry_prices[sym] = {
-            "entry": stock["price"],
-            "time": now_utc,
-            "alert1": None,
-            "alert2": None,
-            "stop": None
+            "entry": stock["price"], "time": now_utc,
+            "alert1": None, "alert2": None, "stop": None,
         }
 
-        # 시뮬 매수 기록
         bought = sim_open(sym, stock["price"])
 
-        rsi_str = f"{result['rsi']:.1f}"
-        obv_str = result["obv_label"]
+        rsi_str     = f"{result['rsi']:.1f}"
+        obv_str     = result["obv_label"]
         ticker_link = naver_link(sym)
 
-        # 누적 손익 한 줄 요약
-        total_pnl = sim_stats["total_pnl"]
-        pnl_sign = "+" if total_pnl >= 0 else ""
+        total_pnl        = sim_stats["total_pnl"]
+        pnl_sign         = "+" if total_pnl >= 0 else ""
         total_return_pct = (total_pnl / sim_stats["initial_cash"]) * 100
 
         if bought:
@@ -506,10 +586,12 @@ def run_scan():
                 f"━━━━━━━━━━━━━━\n"
                 f"📥 2주 @ ${stock['price']:.2f} 매수 기록\n"
                 f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>\n"
-                f"🎯 목표가: +7%(${stock['price']*1.07:.2f}) 1주 절반매도 / +15%(${stock['price']*1.15:.2f}) 전량\n"
-                f"🛑 손절가: -4%(${stock['price']*0.96:.2f})\n"
+                f"🎯 목표: +7%(${stock['price']*1.07:.2f}) 1주 절반 / "
+                f"+15%(${stock['price']*1.15:.2f}) 전량\n"
+                f"🛑 손절: -4%(${stock['price']*0.96:.2f})\n"
                 f"💰 누적 손익: <b>{pnl_sign}{total_pnl:.2f}$</b> ({total_return_pct:+.2f}%) "
-                f"| {sim_stats['wins']}승 {sim_stats['losses']}패"
+                f"| {sim_stats['wins']}승 {sim_stats['losses']}패\n"
+                f"{holdings_block()}"
             )
         else:
             sim_line = (
@@ -517,7 +599,8 @@ def run_scan():
                 f"━━━━━━━━━━━━━━\n"
                 f"⚠️ 예수금 부족 (필요: ${stock['price']*2:.2f} | 보유: ${sim_stats['cash']:.2f})\n"
                 f"💰 누적 손익: <b>{pnl_sign}{total_pnl:.2f}$</b> ({total_return_pct:+.2f}%) "
-                f"| {sim_stats['wins']}승 {sim_stats['losses']}패"
+                f"| {sim_stats['wins']}승 {sim_stats['losses']}패\n"
+                f"{holdings_block()}"
             )
 
         message = (
@@ -533,7 +616,7 @@ def run_scan():
             + sim_line
         )
         send_telegram(message)
-        print(f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}% | RSI {rsi_str} | OBV {obv_str} | 진입가 ${stock['price']:.2f}")
+        print(f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}% | RSI {rsi_str} | 진입가 ${stock['price']:.2f}")
         time.sleep(0.5)
 
 
@@ -542,27 +625,41 @@ def run_scan():
 # ──────────────────────────────────────────
 
 def main():
-    print("=" * 50)
-    print("🚀 급등 감지 봇 v12 (정규장 전용 + 시뮬레이션) 시작!")
-    print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+ | OBV 참고")
+    global market_close_sent
+
+    print("=" * 55)
+    print("🚀 급등 감지 봇 v13 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
-    print(f"💹 시뮬: 매수 신호 시 2주 자동 기록, +7% 1주 절반매도 → +15%/손절 나머지 청산")
-    print("=" * 50)
+    print(f"💹 시뮬: 초기예수금 ${SIM_INITIAL_CASH:.0f} | 2주 매수 | 정각 일지 | 장마감 최종 일지")
+    print("=" * 55)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v12 (정규장 전용 + 시뮬레이션) 시작!</b>\n"
-        f"📈 정규장: 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+ | OBV 참고표시\n"
-        f"🎯 매도알림: +{SELL_PARTIAL_PCT}% 1차 / +{SELL_FULL_PCT}% 전량 / {STOP_LOSS_PCT}% 손절\n"
-        f"💹 시뮬모드: 초기예수금 ${SIM_INITIAL_CASH:.0f} | 매수 신호 → 2주 자동 기록 → +7% 1주 절반매도 / +15%·손절 전량 청산"
+        f"🤖 <b>급등 감지 봇 v13 시작!</b>\n"
+        f"📈 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+ | OBV 참고\n"
+        f"🎯 +{SELL_PARTIAL_PCT}% 1차 / +{SELL_FULL_PCT}% 전량 / {STOP_LOSS_PCT}% 손절\n"
+        f"💹 초기예수금 ${SIM_INITIAL_CASH:.0f} | 매시 정각 일지 | 장마감 최종 일지"
     )
 
     while True:
         now_str = datetime.now().strftime('%H:%M:%S')
+        now_et  = get_et_now()
+
+        # 날짜 바뀌면 장마감 플래그 리셋
+        if now_et.hour == 9 and now_et.minute < 30:
+            if market_close_sent:
+                market_close_sent = False
+                print("[리셋] 장마감 플래그 초기화")
+
+        # 정각 리포트 체크 (장중·장마감 모두)
+        check_scheduled_reports()
+
         if not is_regular_session():
             print(f"[{now_str}] 정규장 외 시간 — 대기 중...")
         else:
             print(f"\n[{now_str}] 정규장 스캔 시작")
             run_scan()
+
         time.sleep(CHECK_INTERVAL)
 
 
