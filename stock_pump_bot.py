@@ -98,15 +98,15 @@ def is_regular_session() -> bool:
 # ──────────────────────────────────────────
 
 def sim_open(sym: str, price: float):
-    """매수 신호 → 1주 매수 기록"""
+    """매수 신호 → 2주 매수 기록"""
     if sym in sim_positions:
         return  # 이미 보유 중이면 중복 매수 안 함
     sim_positions[sym] = {
         "entry": price,
-        "qty": 1,
+        "qty": 2,
         "partial_done": False,
     }
-    print(f"  [시뮬 매수] {sym} 1주 @ ${price:.2f}")
+    print(f"  [시뮬 매수] {sym} 2주 @ ${price:.2f}")
 
 
 def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> float:
@@ -373,8 +373,8 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
             sim_note = ""
             pos = sim_positions.get(sym)
             if pos and not pos.get("partial_done"):
-                # 1주이므로 1차에 전량 청산 (0.5주 불가)
-                sim_note = sim_close(sym, current_price, "+7% 1차", qty=None)
+                # 2주 중 1주만 절반 매도
+                sim_note = sim_close(sym, current_price, "+7% 1차(절반)", qty=1)
 
             send_telegram(
                 f"🟡 <b>1차 매도 타이밍!</b>\n"
