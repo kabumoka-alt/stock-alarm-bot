@@ -52,9 +52,12 @@ last_alert = {}
 sim_positions: dict = {}
 
 # sim_stats: 누적 통계
+SIM_INITIAL_CASH = 100.0   # 초기 예수금 ($)
 sim_stats = {
-    "total_pnl": 0.0,   # 누적 손익 (달러)
-    "trades": 0,         # 완전 청산된 거래 수
+    "initial_cash": SIM_INITIAL_CASH,
+    "cash": SIM_INITIAL_CASH,  # 현재 예수금 (매수 시 차감, 매도 시 반환)
+    "total_pnl": 0.0,          # 누적 실현 손익 (달러)
+    "trades": 0,               # 완전 청산된 거래 수
     "wins": 0,
     "losses": 0,
 }
@@ -97,16 +100,22 @@ def is_regular_session() -> bool:
 # 시뮬레이션 헬퍼
 # ──────────────────────────────────────────
 
-def sim_open(sym: str, price: float):
-    """매수 신호 → 2주 매수 기록"""
+def sim_open(sym: str, price: float) -> bool:
+    """매수 신호 → 2주 매수 기록 + 예수금 차감. 예수금 부족 시 False 반환."""
     if sym in sim_positions:
-        return  # 이미 보유 중이면 중복 매수 안 함
+        return False  # 이미 보유 중
+    cost = price * 2
+    if sim_stats["cash"] < cost:
+        print(f"  [시뮬 매수 불가] {sym} | 필요: ${cost:.2f} | 예수금: ${sim_stats['cash']:.2f}")
+        return False
+    sim_stats["cash"] -= cost
     sim_positions[sym] = {
         "entry": price,
         "qty": 2,
         "partial_done": False,
     }
-    print(f"  [시뮬 매수] {sym} 2주 @ ${price:.2f}")
+    print(f"  [시뮬 매수] {sym} 2주 @ ${price:.2f} | 잔여 예수금: ${sim_stats['cash']:.2f}")
+    return True
 
 
 def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
@@ -123,10 +132,12 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
     pnl = (exit_price - pos["entry"]) * close_qty
     pnl_pct = ((exit_price - pos["entry"]) / pos["entry"]) * 100
 
+    # 예수금 반환 (매도 대금)
+    sim_stats["cash"] += exit_price * close_qty
+
     pos["qty"] -= close_qty
     if pos["qty"] <= 0:
         del sim_positions[sym]
-        # 통계 업데이트
         sim_stats["total_pnl"] += pnl
         sim_stats["trades"] += 1
         if pnl >= 0:
@@ -134,7 +145,6 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
         else:
             sim_stats["losses"] += 1
     else:
-        # 1차 매도(절반) 처리
         pos["partial_done"] = True
         sim_stats["total_pnl"] += pnl
 
@@ -142,6 +152,7 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
         sim_stats["wins"] / sim_stats["trades"] * 100
         if sim_stats["trades"] > 0 else 0.0
     )
+    total_return_pct = (sim_stats["total_pnl"] / sim_stats["initial_cash"]) * 100
 
     summary = (
         f"\n\n💹 <b>[시뮬레이션]</b>\n"
@@ -149,7 +160,9 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
         f"📤 청산: {reason} | {close_qty}주 @ ${exit_price:.2f}\n"
         f"📥 진입가: ${pos['entry']:.2f}\n"
         f"{'📈' if pnl >= 0 else '📉'} 건별 손익: <b>{'+'if pnl>=0 else ''}{pnl:.2f}$ ({pnl_pct:+.2f}%)</b>\n"
-        f"💰 누적 손익: <b>{'+'if sim_stats['total_pnl']>=0 else ''}{sim_stats['total_pnl']:.2f}$</b>\n"
+        f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>\n"
+        f"💰 누적 손익: <b>{'+'if sim_stats['total_pnl']>=0 else ''}{sim_stats['total_pnl']:.2f}$</b> "
+        f"(<b>{total_return_pct:+.2f}%</b>)\n"
         f"🏆 승/패: {sim_stats['wins']}승 {sim_stats['losses']}패 "
         f"(승률 {win_rate:.0f}%) | 총 {sim_stats['trades']}거래"
     )
@@ -476,7 +489,7 @@ def run_scan():
         }
 
         # 시뮬 매수 기록
-        sim_open(sym, stock["price"])
+        bought = sim_open(sym, stock["price"])
 
         rsi_str = f"{result['rsi']:.1f}"
         obv_str = result["obv_label"]
@@ -485,15 +498,27 @@ def run_scan():
         # 누적 손익 한 줄 요약
         total_pnl = sim_stats["total_pnl"]
         pnl_sign = "+" if total_pnl >= 0 else ""
-        sim_line = (
-            f"\n\n💹 <b>[시뮬 매수 기록]</b>\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"📥 2주 @ ${stock['price']:.2f} 매수 기록\n"
-            f"🎯 목표가: +7%(${stock['price']*1.07:.2f}) 1주 절반매도 / +15%(${stock['price']*1.15:.2f}) 전량\n"
-            f"🛑 손절가: -4%(${stock['price']*0.96:.2f})\n"
-            f"💰 현재 누적 손익: <b>{pnl_sign}{total_pnl:.2f}$</b> "
-            f"({sim_stats['wins']}승 {sim_stats['losses']}패)"
-        )
+        total_return_pct = (total_pnl / sim_stats["initial_cash"]) * 100
+
+        if bought:
+            sim_line = (
+                f"\n\n💹 <b>[시뮬 매수 기록]</b>\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"📥 2주 @ ${stock['price']:.2f} 매수 기록\n"
+                f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>\n"
+                f"🎯 목표가: +7%(${stock['price']*1.07:.2f}) 1주 절반매도 / +15%(${stock['price']*1.15:.2f}) 전량\n"
+                f"🛑 손절가: -4%(${stock['price']*0.96:.2f})\n"
+                f"💰 누적 손익: <b>{pnl_sign}{total_pnl:.2f}$</b> ({total_return_pct:+.2f}%) "
+                f"| {sim_stats['wins']}승 {sim_stats['losses']}패"
+            )
+        else:
+            sim_line = (
+                f"\n\n💹 <b>[시뮬 매수 불가]</b>\n"
+                f"━━━━━━━━━━━━━━\n"
+                f"⚠️ 예수금 부족 (필요: ${stock['price']*2:.2f} | 보유: ${sim_stats['cash']:.2f})\n"
+                f"💰 누적 손익: <b>{pnl_sign}{total_pnl:.2f}$</b> ({total_return_pct:+.2f}%) "
+                f"| {sim_stats['wins']}승 {sim_stats['losses']}패"
+            )
 
         message = (
             f"📈 정규장 <b>급등 신호!</b>\n"
@@ -528,7 +553,7 @@ def main():
         f"🤖 <b>급등 감지 봇 v12 (정규장 전용 + 시뮬레이션) 시작!</b>\n"
         f"📈 정규장: 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+ | OBV 참고표시\n"
         f"🎯 매도알림: +{SELL_PARTIAL_PCT}% 1차 / +{SELL_FULL_PCT}% 전량 / {STOP_LOSS_PCT}% 손절\n"
-        f"💹 시뮬모드: 매수 신호 → 2주 자동 기록 → +7% 1주 절반매도 / +15%·손절 전량 청산"
+        f"💹 시뮬모드: 초기예수금 ${SIM_INITIAL_CASH:.0f} | 매수 신호 → 2주 자동 기록 → +7% 1주 절반매도 / +15%·손절 전량 청산"
     )
 
     while True:
