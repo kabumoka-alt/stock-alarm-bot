@@ -1,15 +1,13 @@
 """
-미국 주식 급등 감지 봇 v14 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v16 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
-- 5분봉 5%+ & RSI 50+ & 거래량 조건 충족 시 진입
+- 5분봉 5%+ & RSI 50+ & 거래량 2x+ 조건 충족 시 진입
 - OBV 방향 참고 표시 (필터 아님)
 - 매도 타이밍: +7% 1차(절반), +15% 전량, -4% 손절
-- [v12] 시뮬레이션: 2주 매수 / 예수금 관리 / 누적 손익
-- [v13] 보유 종목 현황 메시지 표시
-- [v13] 매시 정각 중간 매매일지 전송
-- [v13] 장 종료(16:00 ET) 최종 매매일지 전송
 - [v14] 손절 블랙리스트: 당일 손절 종목 재진입 완전 차단
 - [v14] 거래량 조건 추가: 최근 5분봉 평균 대비 2배 이상일 때만 진입
+- [v16] 텔레그램 알림 최소화: 매시 정각 중간 일지 / 장마감 최종 일지만 수신
+- [v16] 급등 신호 / 손절 / 매도 개별 알림 완전 제거 (로그만 출력)
 """
 
 import os
@@ -457,19 +455,8 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
     if gain_pct <= STOP_LOSS_PCT:
         if cooldown_ok("stop"):
             entry["stop"] = now_utc
-            sim_note = sim_close(sym, current_price, "손절(-4%)", qty=None) if sym in sim_positions else ""
-            send_telegram(
-                f"🔴 <b>손절 타이밍!</b>\n"
-                f"━━━━━━━━━━━━━━\n"
-                f"📌 종목: <b>{ticker_link}</b>\n"
-                f"💰 현재가({price_source}): <b>${current_price:.2f}</b>\n"
-                f"📥 진입가: ${entry_price:.2f}\n"
-                f"📉 수익률: <b>{gain_pct:+.2f}%</b>\n"
-                f"⚠️ -4% 손절 구간 진입\n"
-                f"🚫 당일 재진입 차단 적용\n"
-                f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
-                + sim_note
-            )
+            if sym in sim_positions:
+                sim_close(sym, current_price, "손절(-4%)", qty=None)
             print(f"[🔴 손절] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
         return
 
@@ -477,18 +464,8 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
     if gain_pct >= SELL_FULL_PCT:
         if cooldown_ok("alert2"):
             entry["alert2"] = now_utc
-            sim_note = sim_close(sym, current_price, "+15% 전량", qty=None) if sym in sim_positions else ""
-            send_telegram(
-                f"🟢 <b>전량 매도 타이밍!</b>\n"
-                f"━━━━━━━━━━━━━━\n"
-                f"📌 종목: <b>{ticker_link}</b>\n"
-                f"💰 현재가({price_source}): <b>${current_price:.2f}</b>\n"
-                f"📥 진입가: ${entry_price:.2f}\n"
-                f"📈 수익률: <b>{gain_pct:+.2f}%</b>\n"
-                f"✅ +15% 전량 매도 구간\n"
-                f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
-                + sim_note
-            )
+            if sym in sim_positions:
+                sim_close(sym, current_price, "+15% 전량", qty=None)
             print(f"[🟢 전량매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
         return
 
@@ -496,20 +473,9 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
     if gain_pct >= SELL_PARTIAL_PCT:
         if cooldown_ok("alert1"):
             entry["alert1"] = now_utc
-            pos      = sim_positions.get(sym)
-            sim_note = sim_close(sym, current_price, "+7% 1차(절반)", qty=1) \
-                       if pos and not pos.get("partial_done") else ""
-            send_telegram(
-                f"🟡 <b>1차 매도 타이밍!</b>\n"
-                f"━━━━━━━━━━━━━━\n"
-                f"📌 종목: <b>{ticker_link}</b>\n"
-                f"💰 현재가({price_source}): <b>${current_price:.2f}</b>\n"
-                f"📥 진입가: ${entry_price:.2f}\n"
-                f"📈 수익률: <b>{gain_pct:+.2f}%</b>\n"
-                f"💡 +7% → 절반 매도 후 나머지 홀드\n"
-                f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
-                + sim_note
-            )
+            pos = sim_positions.get(sym)
+            if pos and not pos.get("partial_done"):
+                sim_close(sym, current_price, "+7% 1차(절반)", qty=1)
             print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
 
 
@@ -648,50 +614,8 @@ def run_scan():
         bought      = sim_open(sym, stock["price"])
         ticker_link = naver_link(sym)
 
-        total_pnl        = sim_stats["total_pnl"]
-        pnl_sign         = "+" if total_pnl >= 0 else ""
-        total_return_pct = (total_pnl / sim_stats["initial_cash"]) * 100
-
-        if bought:
-            sim_line = (
-                f"\n\n💹 <b>[시뮬 매수 기록]</b>\n"
-                f"━━━━━━━━━━━━━━\n"
-                f"📥 2주 @ ${stock['price']:.2f} 매수 기록\n"
-                f"💵 예수금: <b>${sim_stats['cash']:.2f}</b>\n"
-                f"🎯 목표: +7%(${stock['price']*1.07:.2f}) 1주 절반 / "
-                f"+15%(${stock['price']*1.15:.2f}) 전량\n"
-                f"🛑 손절: -4%(${stock['price']*0.96:.2f}) → 당일 재진입 차단\n"
-                f"💰 누적 손익: <b>{pnl_sign}{total_pnl:.2f}$</b> ({total_return_pct:+.2f}%) "
-                f"| {sim_stats['wins']}승 {sim_stats['losses']}패\n"
-                f"{holdings_block()}"
-            )
-        else:
-            reason = "당일 블랙리스트" if sym in blacklisted_today else f"예수금 부족 (필요: ${stock['price']*2:.2f} | 보유: ${sim_stats['cash']:.2f})"
-            sim_line = (
-                f"\n\n💹 <b>[시뮬 매수 불가]</b>\n"
-                f"━━━━━━━━━━━━━━\n"
-                f"⚠️ {reason}\n"
-                f"💰 누적 손익: <b>{pnl_sign}{total_pnl:.2f}$</b> ({total_return_pct:+.2f}%) "
-                f"| {sim_stats['wins']}승 {sim_stats['losses']}패\n"
-                f"{holdings_block()}"
-            )
-
-        message = (
-            f"📈 정규장 <b>급등 신호!</b>\n"
-            f"━━━━━━━━━━━━━━\n"
-            f"📌 종목: <b>{ticker_link}</b>\n"
-            f"💰 현재가({stock['price_source']}): <b>${stock['price']:.2f}</b>\n"
-            f"📉 전일종가: ${stock['prev_close']:.2f}\n"
-            f"📈 일중 상승률: <b>{stock['change_pct']:+.2f}%</b>\n"
-            f"⚡ 5분 상승: <b>{result['price_change_5m']:+.2f}%</b>\n"
-            f"📊 RSI: <b>{result['rsi']:.1f}</b> | OBV: <b>{result['obv_label']}</b>\n"
-            f"📦 거래량: <b>{result['vol_ratio']:.1f}x</b> (평균 대비)\n"
-            f"🇰🇷 한국시간: {now_kst.strftime('%m/%d %H:%M:%S')}"
-            + sim_line
-        )
-        send_telegram(message)
         print(
-            f"[🚀 알림!] {sym} | {stock['change_pct']:+.2f}% | RSI {result['rsi']:.1f} "
+            f"[🚀 감지] {sym} | {stock['change_pct']:+.2f}% | RSI {result['rsi']:.1f} "
             f"| 거래량 {result['vol_ratio']:.1f}x | 진입가 ${stock['price']:.2f}"
         )
         time.sleep(0.5)
@@ -714,11 +638,10 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v14 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v16 시작!</b>\n"
         f"📈 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+ | 거래량 {VOLUME_SURGE_RATIO}x+\n"
-        f"🎯 +{SELL_PARTIAL_PCT}% 1차 / +{SELL_FULL_PCT}% 전량 / {STOP_LOSS_PCT}% 손절\n"
         f"🚫 손절 종목 당일 재진입 차단 (블랙리스트)\n"
-        f"💹 초기예수금 ${SIM_INITIAL_CASH:.0f} | 매시 정각 일지 | 장마감 최종 일지"
+        f"💹 텔레그램: 매시 정각 일지 / 장마감 최종 일지만 수신"
     )
 
     while True:
