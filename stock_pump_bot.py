@@ -21,7 +21,7 @@ TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 
 # 정규장 조건
-REGULAR_TOP_N        = 50
+REGULAR_TOP_N        = 10
 REGULAR_RSI          = 50
 PRICE_CHANGE_5M      = 5.0
 VOLUME_SURGE_RATIO   = 2.0   # [v14] 최근 5분봉 평균 대비 현재 거래량 배율 기준
@@ -33,7 +33,7 @@ SELL_COOLDOWN_MINUTES = 60
 # 매도 타이밍 임계값
 SELL_PARTIAL_PCT = 7.0
 SELL_FULL_PCT    = 15.0
-STOP_LOSS_PCT    = -4.0
+STOP_LOSS_PCT    = -10.0
 
 HEADERS = {
     "APCA-API-KEY-ID":     ALPACA_API_KEY,
