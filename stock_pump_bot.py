@@ -22,7 +22,7 @@ TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 
 # 정규장 조건
-REGULAR_TOP_N        = 10
+REGULAR_TOP_N        = 30
 REGULAR_RSI          = 50
 PRICE_CHANGE_1M      = 5.0
 VOLUME_SURGE_RATIO   = 2.0   # [v14] 최근 5분봉 평균 대비 현재 거래량 배율 기준
@@ -37,8 +37,9 @@ SELL_FULL_PCT    = 15.0
 STOP_LOSS_PCT    = -10.0
 
 # [v18] 횡보 청산 조건
-SIDEWAYS_MINUTES = 10      # 매수 후 이 시간(분) 동안
-SIDEWAYS_PCT     = 3.0     # 진입가 대비 ±이 범위 이내면 횡보로 판단 → 전량 청산
+SIDEWAYS_MINUTES = 10
+SIDEWAYS_MIN_PCT = 3.0     # [v20] 횡보 구간 하한
+SIDEWAYS_MAX_PCT = 7.0     # [v20] 횡보 구간 상한 (+3~+7% 이내면 횡보 청산)
 
 HEADERS = {
     "APCA-API-KEY-ID":     ALPACA_API_KEY,
@@ -52,6 +53,7 @@ last_alert   = {}
 # 시뮬레이션 상태
 # ──────────────────────────────────────────
 SIM_INITIAL_CASH = 100.0
+SIM_BUY_RATIO    = 0.30   # [v20] 예수금의 30%로 매수
 
 sim_positions: dict = {}
 # { sym: {"entry": float, "qty": int, "partial_done": bool} }
@@ -219,26 +221,27 @@ def build_trade_report(title: str) -> str:
 # ──────────────────────────────────────────
 
 def sim_open(sym: str, price: float) -> bool:
-    """매수 신호 → 2주 매수 기록 + 예수금 차감."""
+    """매수 신호 → 예수금의 30%로 최대 주수 매수."""
     if sym in sim_positions:
         return False
-    # [v14] 블랙리스트 종목 재진입 차단
     if sym in blacklisted_today:
         print(f"  [시뮬 매수 차단] {sym} — 당일 블랙리스트")
         return False
-    cost = price * 2
-    if sim_stats["cash"] < cost:
-        print(f"  [시뮬 매수 불가] {sym} | 필요: ${cost:.2f} | 예수금: ${sim_stats['cash']:.2f}")
+    budget = sim_stats["cash"] * SIM_BUY_RATIO
+    qty    = int(budget // price)
+    if qty < 1:
+        print(f"  [시뮬 매수 불가] {sym} | 예수금 부족 (30%={budget:.2f}, 1주={price:.2f})")
         return False
+    cost = price * qty
     sim_stats["cash"] -= cost
-    sim_positions[sym] = {"entry": price, "qty": 2, "partial_done": False}
+    sim_positions[sym] = {"entry": price, "qty": qty, "partial_done": False}
     now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
     trade_log.append({
-        "action": "BUY", "sym": sym, "qty": 2, "price": price,
+        "action": "BUY", "sym": sym, "qty": qty, "price": price,
         "pnl": 0.0, "pnl_pct": 0.0, "reason": "매수",
         "time_kst": now_kst.strftime("%H:%M"),
     })
-    print(f"  [시뮬 매수] {sym} 2주 @ ${price:.2f} | 잔여 예수금: ${sim_stats['cash']:.2f}")
+    print(f"  [시뮬 매수] {sym} {qty}주 @ ${price:.2f} (예수금 30%={cost:.2f}) | 잔여: ${sim_stats['cash']:.2f}")
     return True
 
 
@@ -499,10 +502,10 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
             return True
         return (now_utc - last).total_seconds() / 60 >= SELL_COOLDOWN_MINUTES
 
-    # ── 횡보 청산 (매수 후 10분 경과 & ±3% 이내) ──
+    # ── 횡보 청산 (매수 후 10분 경과 & +3~+7% 미만) ──
     elapsed_min = (now_utc - entry["time"]).total_seconds() / 60
     if elapsed_min >= SIDEWAYS_MINUTES and not entry.get("sideways_done"):
-        if 0 <= gain_pct <= SIDEWAYS_PCT:
+        if SIDEWAYS_MIN_PCT <= gain_pct < SIDEWAYS_MAX_PCT:
             entry["sideways_done"] = True
             if sym in sim_positions:
                 sim_close(sym, current_price, "횡보청산", qty=None)
@@ -533,7 +536,8 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
             entry["alert1"] = now_utc
             pos = sim_positions.get(sym)
             if pos and not pos.get("partial_done"):
-                sim_close(sym, current_price, "+7% 1차(절반)", qty=1)
+                half = max(1, pos["qty"] // 2)
+                sim_close(sym, current_price, "+7% 1차(절반)", qty=half)
             print(f"[🟡 1차매도] {sym} | ${entry_price:.2f} → ${current_price:.2f} ({gain_pct:+.2f}%)")
 
 
