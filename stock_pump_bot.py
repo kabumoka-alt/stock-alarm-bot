@@ -1,7 +1,7 @@
 """
 미국 주식 급등 감지 봇 v18 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
-- 5분봉 3%+ & RSI 50+ & 거래량 2x+ 조건 충족 시 진입
+- 1분봉 5%+ & RSI 50+ & 거래량 2x+ 조건 충족 시 진입
 - OBV 방향 참고 표시 (필터 아님)
 - 매도 타이밍: +7% 1차(절반), +15% 전량, -10% 손절
 - [v14] 손절 블랙리스트: 당일 손절 종목 재진입 완전 차단
@@ -24,7 +24,7 @@ TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 # 정규장 조건
 REGULAR_TOP_N        = 10
 REGULAR_RSI          = 50
-PRICE_CHANGE_5M      = 3.0
+PRICE_CHANGE_1M      = 5.0
 VOLUME_SURGE_RATIO   = 2.0   # [v14] 최근 5분봉 평균 대비 현재 거래량 배율 기준
 
 CHECK_INTERVAL        = 60
@@ -549,11 +549,11 @@ def analyze_regular(sym: str, snap: dict):
 
     latest_price, _ = get_live_price(snap)
     current_price   = latest_price or float(bars[-1]["c"])
-    price_5m_ago    = float(bars[-6]["c"])
-    if price_5m_ago <= 0:
+    price_1m_ago    = float(bars[-2]["c"])
+    if price_1m_ago <= 0:
         return None
 
-    price_change_5m    = ((current_price - price_5m_ago) / price_5m_ago) * 100
+    price_change_1m    = ((current_price - price_1m_ago) / price_1m_ago) * 100
     rsi                = calc_rsi(bars)
     if rsi is None:
         return None
@@ -565,20 +565,20 @@ def analyze_regular(sym: str, snap: dict):
     # [v17] ATR 계산
     atr = calc_atr(bars)
 
-    price_ok_str = "✅" if price_change_5m >= PRICE_CHANGE_5M else "❌"
+    price_ok_str = "✅" if price_change_1m >= PRICE_CHANGE_1M else "❌"
     vol_ok_str   = "✅" if vol_ok else "❌"
     print(
-        f"  └ RSI:{rsi:.1f} | 5분:{price_change_5m:+.2f}%{price_ok_str} "
+        f"  └ RSI:{rsi:.1f} | 1분:{price_change_1m:+.2f}%{price_ok_str} "
         f"| 거래량:{vol_ratio:.1f}x{vol_ok_str} | ATR:{atr:.3f} | OBV:{obv_label}"
     )
 
-    # 진입 조건: 5분 상승 + RSI + 거래량 급등 모두 충족
-    if price_change_5m < PRICE_CHANGE_5M or rsi < REGULAR_RSI or not vol_ok:
+    # 진입 조건: 1분 상승 + RSI + 거래량 급등 모두 충족
+    if price_change_1m < PRICE_CHANGE_1M or rsi < REGULAR_RSI or not vol_ok:
         return None
 
     return {
         "rsi":             rsi,
-        "price_change_5m": price_change_5m,
+        "price_change_1m": price_change_1m,
         "obv_label":       obv_label,
         "vol_ratio":       vol_ratio,
         "atr":             atr,
@@ -703,17 +703,17 @@ def main():
     global market_close_sent
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v14 (정규장 전용 + 시뮬 + 매매일지) 시작!")
-    print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+")
+    print("🚀 급등 감지 봇 v19 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | RSI {REGULAR_RSI}+")
     print(f"📦 거래량 조건: 평균 대비 {VOLUME_SURGE_RATIO}x 이상")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
+    print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & 0~+{SIDEWAYS_PCT}% 이내")
     print(f"🚫 손절 시 당일 블랙리스트 등록 (재진입 차단)")
-    print(f"💹 시뮬: 초기예수금 ${SIM_INITIAL_CASH:.0f} | 2주 매수 | 정각 일지 | 장마감 최종 일지")
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v17 시작!</b>\n"
-        f"📈 5분 {PRICE_CHANGE_5M}%+ | RSI {REGULAR_RSI}+ | 거래량 {VOLUME_SURGE_RATIO}x+\n"
+        f"🤖 <b>급등 감지 봇 v19 시작!</b>\n"
+        f"📈 1분 {PRICE_CHANGE_1M}%+ | RSI {REGULAR_RSI}+ | 거래량 {VOLUME_SURGE_RATIO}x+\n"
         f"📊 상위 {REGULAR_TOP_N}종목 → ATR 높은 순 재정렬 후 진입\n"
         f"🚫 손절(-10%) 종목 당일 재진입 차단 (블랙리스트)\n"
         f"💹 텔레그램: 매시 정각 일지 / 장마감 최종 일지만 수신"
