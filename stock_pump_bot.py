@@ -417,21 +417,22 @@ def calc_obv(bars: list) -> str:
 
 def calc_volume_surge(bars: list) -> tuple[float, bool]:
     """
-    [v14] 거래량 급등 체크.
-    최근 20봉 평균 거래량 대비 마지막 봉 거래량 비율 계산.
+    [v22] 거래량 급등 체크 — 5분 합산 기준.
+    최근 5봉 합산 거래량 vs 그 이전 20봉 평균×5 비교.
     반환: (배율, 조건충족여부)
     """
-    if len(bars) < 6:
+    if len(bars) < 26:   # 5봉 + 이전 20봉 + 여유 1봉
         return 0.0, False
-    # 마지막 봉 제외한 최근 20봉(또는 가능한 봉) 평균
-    history_bars = bars[:-1][-20:]
-    if not history_bars:
+    recent_5   = bars[-5:]           # 최근 5봉
+    history_20 = bars[-26:-5]        # 그 이전 20봉 (겹치지 않게)
+    if not history_20:
         return 0.0, False
-    avg_vol = sum(float(b["v"]) for b in history_bars) / len(history_bars)
-    if avg_vol <= 0:
+    avg_vol_per_bar = sum(float(b["v"]) for b in history_20) / len(history_20)
+    if avg_vol_per_bar <= 0:
         return 0.0, False
-    cur_vol = float(bars[-1]["v"])
-    ratio   = cur_vol / avg_vol
+    recent_vol  = sum(float(b["v"]) for b in recent_5)
+    baseline    = avg_vol_per_bar * 5   # 이전 평균을 5봉 기준으로 환산
+    ratio       = recent_vol / baseline
     return ratio, ratio >= VOLUME_SURGE_RATIO
 
 
@@ -551,7 +552,7 @@ def check_sell_timing(sym: str, current_price: float, price_source: str):
 
 def analyze_regular(sym: str, snap: dict):
     bars = get_bars(sym)
-    if not bars or len(bars) < 6:
+    if not bars or len(bars) < 26:
         print(f"  └ 데이터 부족: {len(bars) if bars else 0}개")
         return None
 
