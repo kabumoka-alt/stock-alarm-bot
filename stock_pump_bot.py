@@ -9,7 +9,7 @@
 - [v17] ATR 기반 변동성 정렬: 상위 30종목 중 ATR 높은 순으로 재정렬 후 진입
 - [v18] 횡보 청산: 매수 후 10분 경과 & +3~+7% 구간 시 전량 청산
 - [v19] 매매일지 보유 종목에 현재가/수익률 표시 (API 조회)
-- [v20] 진입 조건 완화: 1분봉 5%→3%, 거래량 2x→1.5x
+- [v21] 스크리너 변경: most-actives(거래횟수) → movers(상승률 기준)
 """
 
 import os
@@ -320,12 +320,15 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
 # ──────────────────────────────────────────
 
 def get_active_symbols():
-    url    = "https://data.alpaca.markets/v1beta1/screener/stocks/most-actives"
-    params = {"by": "trades", "top": 100}
+    # [v21] most-actives(거래횟수) → movers(상승률 기준)으로 변경
+    url    = "https://data.alpaca.markets/v1beta1/screener/stocks/movers"
+    params = {"top": 100}
     try:
         resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
         if resp.status_code == 200:
-            return [d["symbol"] for d in resp.json().get("most_actives", [])]
+            data    = resp.json()
+            gainers = data.get("gainers", [])
+            return [d["symbol"] for d in gainers]
         print(f"[스크리너 오류] {resp.status_code}")
         return []
     except Exception as e:
@@ -708,7 +711,7 @@ def main():
     global market_close_sent
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v20 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 봇 v21 (정규장 전용 + 시뮬 + 매매일지) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | 거래량 {VOLUME_SURGE_RATIO}x+")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
     print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% 구간")
@@ -716,9 +719,9 @@ def main():
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v20 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v21 시작!</b>\n"
         f"📈 1분 {PRICE_CHANGE_1M}%+ | 거래량 {VOLUME_SURGE_RATIO}x+\n"
-        f"📊 상위 {REGULAR_TOP_N}종목 → ATR 높은 순 재정렬 후 진입\n"
+        f"📊 상승률 상위 {REGULAR_TOP_N}종목 → ATR 높은 순 재정렬 후 진입\n"
         f"🚫 손절(-10%) 종목 당일 재진입 차단 (블랙리스트)\n"
         f"💹 텔레그램: 매시 정각 일지 / 장마감 최종 일지만 수신"
     )
