@@ -1,15 +1,15 @@
 """
-미국 주식 급등 감지 봇 v20 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v23 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
-- 1분봉 3%+ & 거래량 1.5x+ 조건 충족 시 진입 (v20 완화)
+- 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
 - 매도 타이밍: +7% 1차(절반), +15% 전량, -10% 손절
-- [v14] 손절 블랙리스트: 당일 손절 종목 재진입 완전 차단
 - [v16] 텔레그램 알림 최소화: 매시 정각 중간 일지 / 장마감 최종 일지만 수신
 - [v17] ATR 기반 변동성 정렬: 상위 30종목 중 ATR 높은 순으로 재정렬 후 진입
 - [v18] 횡보 청산: 매수 후 10분 경과 & +3~+7% 구간 시 전량 청산
 - [v19] 매매일지 보유 종목에 현재가/수익률 표시 (API 조회)
 - [v21] 스크리너 변경: most-actives(거래횟수) → movers(상승률 기준)
+- [v23] 손절 블랙리스트 → 종목당 손절 횟수 제한으로 전환 (2회까지 재진입 허용, 3회째부터 당일 차단)
 """
 
 import os
@@ -68,7 +68,12 @@ sim_stats = {
     "losses":       0,
 }
 
-# [v14] 당일 손절 블랙리스트: 손절된 종목 → 당일 재진입 금지
+# [v23] 종목당 손절 횟수 제한으로 전환
+# stop_loss_count[sym] = 당일 손절 횟수, MAX_STOP_LOSS_COUNT 도달 시 당일 블랙리스트
+stop_loss_count: dict = {}
+MAX_STOP_LOSS_COUNT = 2   # 2회까지는 재진입 허용, 3회째 손절부터 당일 차단
+
+# 손절 횟수가 MAX_STOP_LOSS_COUNT 이상 도달한 종목 (실질 블랙리스트)
 blacklisted_today: set = set()
 
 # 오늘 거래 일지: [{"sym", "action", "qty", "price", "pnl", "pnl_pct", "time_kst"}]
@@ -150,7 +155,9 @@ def holdings_block(current_prices: dict = None) -> str:
 def blacklist_block() -> str:
     if not blacklisted_today:
         return ""
-    syms = ", ".join(sorted(blacklisted_today))
+    syms = ", ".join(
+        f"{sym}({stop_loss_count.get(sym, 0)}회)" for sym in sorted(blacklisted_today)
+    )
     return f"🚫 <b>당일 블랙리스트:</b> {syms}"
 
 
@@ -277,10 +284,16 @@ def sim_close(sym: str, exit_price: float, reason: str, qty: int = None) -> str:
         pos["partial_done"]     = True
         sim_stats["total_pnl"] += pnl
 
-    # [v14] 손절 시 당일 블랙리스트 등록
+    # [v23] 손절 시 카운트 증가, 허용 횟수(MAX_STOP_LOSS_COUNT) 도달 시에만 블랙리스트 등록
     if "손절" in reason:
-        blacklisted_today.add(sym)
-        print(f"  [블랙리스트 등록] {sym} — 당일 재진입 금지")
+        stop_loss_count[sym] = stop_loss_count.get(sym, 0) + 1
+        cnt = stop_loss_count[sym]
+        if cnt > MAX_STOP_LOSS_COUNT:
+            blacklisted_today.add(sym)
+            print(f"  [블랙리스트 등록] {sym} — 손절 {cnt}회 누적, 당일 재진입 금지")
+        else:
+            remaining = MAX_STOP_LOSS_COUNT - cnt
+            print(f"  [손절 카운트] {sym} — {cnt}회째 (재진입 {remaining}회 더 허용)")
 
     now_kst = datetime.now(timezone.utc) + timedelta(hours=9)
     trade_log.append({
@@ -712,18 +725,18 @@ def main():
     global market_close_sent
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v21 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 봇 v23 (정규장 전용 + 시뮬 + 매매일지) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | 거래량 {VOLUME_SURGE_RATIO}x+")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
     print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% 구간")
-    print(f"🚫 손절 시 당일 블랙리스트 등록 (재진입 차단)")
+    print(f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 블랙리스트 등록 (그 전까진 재진입 허용)")
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v21 시작!</b>\n"
+        f"🤖 <b>급등 감지 봇 v23 시작!</b>\n"
         f"📈 1분 {PRICE_CHANGE_1M}%+ | 거래량 {VOLUME_SURGE_RATIO}x+\n"
         f"📊 상승률 상위 {REGULAR_TOP_N}종목 → ATR 높은 순 재정렬 후 진입\n"
-        f"🚫 손절(-10%) 종목 당일 재진입 차단 (블랙리스트)\n"
+        f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 차단 (그 전까진 재진입 허용)\n"
         f"💹 텔레그램: 매시 정각 일지 / 장마감 최종 일지만 수신"
     )
 
@@ -736,9 +749,10 @@ def main():
             if market_close_sent:
                 market_close_sent = False
                 print("[리셋] 장마감 플래그 초기화")
-            if blacklisted_today:
+            if blacklisted_today or stop_loss_count:
                 blacklisted_today.clear()
-                print("[리셋] 블랙리스트 초기화 (새 장 시작)")
+                stop_loss_count.clear()
+                print("[리셋] 블랙리스트 및 손절 카운트 초기화 (새 장 시작)")
 
         check_scheduled_reports()
 
