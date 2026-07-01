@@ -1,5 +1,5 @@
 """
-미국 주식 급등 감지 봇 v27 (정규장 전용 + 시뮬레이션 + 매매일지)
+미국 주식 급등 감지 봇 v30 (정규장 전용 + 시뮬레이션 + 매매일지)
 - 정규장(09:30~16:00 ET)만 스캔
 - 1분봉 3%+ 조건 충족 시 진입 (거래량은 참고용 표시만)
 - OBV 방향 참고 표시 (필터 아님)
@@ -10,7 +10,7 @@
 - [v19] 매매일지 보유 종목에 현재가/수익률 표시 (API 조회)
 - [v21] 스크리너 변경: most-actives(거래횟수) → movers(상승률 기준)
 - [v25] 저가주 필터: $1 미만 종목 진입 제외
-- [v27] 워런트/유닛 제외: .WS, W로 끝나는 티커 등 파생상품 진입 차단
+- [v30] 예수금 배분 방식 변경: 30% 고정 → 남은 슬롯 균등 분배 (예수금 ÷ 남은 슬롯)
 """
 
 import os
@@ -34,6 +34,7 @@ CHECK_INTERVAL        = 60
 COOLDOWN_MINUTES      = 30
 SELL_COOLDOWN_MINUTES = 60
 MAX_BUY_PER_SCAN      = 3    # [v24] 스캔 1회당 신규 매수 최대 종목 수
+MAX_POSITIONS         = 7    # [v29] 동시 보유 최대 종목 수
 
 # 매도 타이밍 임계값
 SELL_PARTIAL_PCT = 7.0
@@ -57,7 +58,7 @@ last_alert   = {}
 # 시뮬레이션 상태
 # ──────────────────────────────────────────
 SIM_INITIAL_CASH = 100.0
-SIM_BUY_RATIO    = 0.30   # [v20] 예수금의 30%로 매수
+# [v30] 예수금 배분: 남은 슬롯(MAX_POSITIONS - 현재보유) 균등 분배 방식으로 전환
 
 sim_positions: dict = {}
 # { sym: {"entry": float, "qty": int, "partial_done": bool} }
@@ -95,18 +96,47 @@ def naver_link(sym: str) -> str:
     return f'<a href="https://m.stock.naver.com/worldstock/stock/{sym}/total">{sym}</a>'
 
 
-def send_telegram(message: str):
+def _send_telegram_chunk(text: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, json={
             "chat_id":    TELEGRAM_CHAT_ID,
-            "text":       message,
+            "text":       text,
             "parse_mode": "HTML",
         }, timeout=5)
         if resp.status_code != 200:
             print(f"[텔레그램 오류] {resp.text}")
     except Exception as e:
         print(f"[텔레그램 예외] {e}")
+
+
+def send_telegram(message: str):
+    """텔레그램 전송. 4096자 초과 시 줄 단위로 나눠 여러 메시지로 전송."""
+    TELEGRAM_MAX = 4000   # 안전 여유 (실제 한도 4096)
+    if len(message) <= TELEGRAM_MAX:
+        _send_telegram_chunk(message)
+        return
+
+    # 줄 단위로 잘라서 청크 구성
+    lines = message.split("\n")
+    chunk = ""
+    for line in lines:
+        # 한 줄 자체가 너무 길면 강제로 잘라 전송
+        if len(line) > TELEGRAM_MAX:
+            if chunk:
+                _send_telegram_chunk(chunk)
+                chunk = ""
+            for i in range(0, len(line), TELEGRAM_MAX):
+                _send_telegram_chunk(line[i:i + TELEGRAM_MAX])
+            continue
+        # 현재 청크에 이 줄을 더하면 한도 초과 → 지금까지 청크 전송 후 새로 시작
+        if len(chunk) + len(line) + 1 > TELEGRAM_MAX:
+            _send_telegram_chunk(chunk)
+            chunk = line
+        else:
+            chunk = f"{chunk}\n{line}" if chunk else line
+    if chunk:
+        _send_telegram_chunk(chunk)
 
 
 def get_et_now():
@@ -232,16 +262,22 @@ def build_trade_report(title: str) -> str:
 # ──────────────────────────────────────────
 
 def sim_open(sym: str, price: float) -> bool:
-    """매수 신호 → 예수금의 30%로 최대 주수 매수."""
+    """매수 신호 → 남은 슬롯 균등 분배 방식으로 매수 (예수금 ÷ 남은 슬롯)."""
     if sym in sim_positions:
         return False
     if sym in blacklisted_today:
         print(f"  [시뮬 매수 차단] {sym} — 당일 블랙리스트")
         return False
-    budget = sim_stats["cash"] * SIM_BUY_RATIO
-    qty    = int(budget // price)
+    # [v29] 동시 보유 종목 수 제한
+    if len(sim_positions) >= MAX_POSITIONS:
+        print(f"  [시뮬 매수 불가] {sym} — 보유 종목 {len(sim_positions)}개 (최대 {MAX_POSITIONS}개)")
+        return False
+    # [v30] 남은 슬롯에 예수금 균등 분배
+    remaining_slots = MAX_POSITIONS - len(sim_positions)
+    budget          = sim_stats["cash"] / remaining_slots
+    qty             = int(budget // price)
     if qty < 1:
-        print(f"  [시뮬 매수 불가] {sym} | 예수금 부족 (30%={budget:.2f}, 1주={price:.2f})")
+        print(f"  [시뮬 매수 불가] {sym} | 예수금 부족 (슬롯예산={budget:.2f}, 1주={price:.2f})")
         return False
     cost = price * qty
     sim_stats["cash"] -= cost
@@ -252,7 +288,7 @@ def sim_open(sym: str, price: float) -> bool:
         "pnl": 0.0, "pnl_pct": 0.0, "reason": "매수",
         "time_kst": now_kst.strftime("%H:%M"),
     })
-    print(f"  [시뮬 매수] {sym} {qty}주 @ ${price:.2f} (예수금 30%={cost:.2f}) | 잔여: ${sim_stats['cash']:.2f}")
+    print(f"  [시뮬 매수] {sym} {qty}주 @ ${price:.2f} (슬롯예산={cost:.2f}, 남은슬롯 {remaining_slots}) | 잔여: ${sim_stats['cash']:.2f}")
     return True
 
 
@@ -788,17 +824,19 @@ def main():
     global market_close_sent
 
     print("=" * 60)
-    print("🚀 급등 감지 봇 v27 (정규장 전용 + 시뮬 + 매매일지) 시작!")
+    print("🚀 급등 감지 봇 v30 (정규장 전용 + 시뮬 + 매매일지) 시작!")
     print(f"📈 정규장: 상위 {REGULAR_TOP_N}종목 | 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만")
     print(f"🎯 매도: +{SELL_PARTIAL_PCT}% 1차 | +{SELL_FULL_PCT}% 전량 | {STOP_LOSS_PCT}% 손절")
     print(f"➡️  횡보청산: {SIDEWAYS_MINUTES}분 경과 & +{SIDEWAYS_MIN_PCT}~+{SIDEWAYS_MAX_PCT}% 구간")
+    print(f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목")
     print(f"🔔 장마감 보유 종목 전량 강제 청산")
     print(f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 블랙리스트 등록 (그 전까진 재진입 허용)")
     print("=" * 60)
 
     send_telegram(
-        f"🤖 <b>급등 감지 봇 v27 시작!</b>\n"
-        f"📈 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목\n"
+        f"🤖 <b>급등 감지 봇 v30 시작!</b>\n"
+        f"📈 1분 {PRICE_CHANGE_1M}%+ | ${MIN_PRICE}+ 종목만\n"
+        f"📦 동시 보유 최대 {MAX_POSITIONS}종목 | 스캔당 최대 {MAX_BUY_PER_SCAN}종목\n"
         f"📊 상승률 상위 {REGULAR_TOP_N}종목 → ATR 높은 순 재정렬 후 진입\n"
         f"🔔 장마감 보유 종목 전량 강제 청산\n"
         f"🚫 손절 {MAX_STOP_LOSS_COUNT}회 도달 시 당일 차단 (그 전까진 재진입 허용)\n"
